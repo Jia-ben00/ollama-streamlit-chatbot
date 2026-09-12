@@ -12,7 +12,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sentiment_analysis.config import config
 from sentiment_analysis.dataset import Vocabulary
+from sentiment_analysis.dataset_chinese import ChineseVocabulary
 from sentiment_analysis.model import BiLSTMSentiment
+
+
+CHINESE_MODEL_NAME = "bilstm_chinese_sentiment.pt"
+CHINESE_VOCAB_NAME = "vocab_chinese.json"
+CHINESE_MAX_SEQ_LENGTH = 150
 
 
 class SentimentPredictor:
@@ -82,6 +88,67 @@ class SentimentPredictor:
 
     def predict_batch(self, texts: list) -> list:
         """批量预测。"""
+        return [self.predict(text) for text in texts]
+
+
+class ChineseSentimentPredictor:
+    """中文情感分析预测器。"""
+
+    def __init__(
+        self,
+        checkpoint_path: str = None,
+        vocab_path: str = None,
+        device: torch.device = None,
+    ):
+        if checkpoint_path is None:
+            checkpoint_path = os.path.join(config.checkpoint_dir, CHINESE_MODEL_NAME)
+        if vocab_path is None:
+            vocab_path = os.path.join(config.checkpoint_dir, CHINESE_VOCAB_NAME)
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.device = device
+        self.vocab = ChineseVocabulary.load(vocab_path)
+
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model_config = checkpoint["config"]
+        self.model = BiLSTMSentiment(
+            vocab_size=checkpoint["vocab_size"],
+            embedding_dim=model_config["embedding_dim"],
+            hidden_dim=model_config["hidden_dim"],
+            num_layers=model_config["num_layers"],
+            bidirectional=model_config["bidirectional"],
+            dropout=model_config["dropout"],
+            num_classes=model_config["num_classes"],
+            pad_idx=self.vocab.char2idx[self.vocab.PAD_TOKEN],
+        ).to(device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.eval()
+
+        self.class_names = ["负面 (Negative)", "正面 (Positive)"]
+
+    def predict(self, text: str) -> dict:
+        """对中文文本进行情感预测。"""
+        encoded = self.vocab.encode(text, max_length=CHINESE_MAX_SEQ_LENGTH)
+        input_tensor = torch.tensor([encoded], dtype=torch.long).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(input_tensor)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+            pred_label = int(torch.argmax(logits, dim=1).item())
+
+        return {
+            "text": text,
+            "predicted_label": pred_label,
+            "predicted_class": self.class_names[pred_label],
+            "probabilities": {
+                self.class_names[i]: float(probs[i])
+                for i in range(len(self.class_names))
+            },
+            "confidence": float(max(probs)),
+        }
+
+    def predict_batch(self, texts: list) -> list:
         return [self.predict(text) for text in texts]
 
 

@@ -10,7 +10,13 @@ import sys
 import os
 
 # 确保项目根目录在 Python 路径中
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _PROJECT_ROOT)
+
+# 如果项目目录下有 lib/ 文件夹（本地安装的 PyTorch 等依赖），也加入路径
+_LIB_DIR = os.path.join(_PROJECT_ROOT, "lib")
+if os.path.isdir(_LIB_DIR):
+    sys.path.insert(0, _LIB_DIR)
 
 import streamlit as st
 
@@ -214,135 +220,186 @@ if mode == "💬 智能聊天":
 # ══════════════════════════════════════════════════════════
 else:  # mode == "😊 情感分析"
     with st.sidebar:
-        st.subheader("模型信息")
-        st.info(
-            "**BiLSTM 情感分类模型**\n\n"
-            "- 框架：PyTorch\n"
-            "- 架构：Embedding + 双向 LSTM + 全连接层\n"
-            "- 参数量：约 73.8 万\n"
-            "- 测试集准确率：97.0%\n"
-            "- 数据：1166 条影评标注数据"
+        st.subheader("语言选择")
+        lang = st.radio(
+            "分析语言",
+            options=["🇨🇳 中文", "🇬🇧 English"],
+            index=0,
+            help="选择情感分析模型的语言",
         )
+        is_chinese = lang.startswith("🇨🇳")
+
         st.divider()
-        st.subheader("使用说明")
-        st.markdown(
-            "在右侧输入英文文本，模型将判断其情感倾向（正面/负面），"
-            "并输出置信度概率。\n\n"
-            "适用于影评、评论、反馈等文本的情感分析。"
-        )
+        st.subheader("模型信息")
+        if is_chinese:
+            st.info(
+                "**中文 BiLSTM 情感分类模型**\n\n"
+                "- 框架：PyTorch\n"
+                "- 架构：Embedding + 双向 LSTM + 全连接层\n"
+                "- 分词：字符级分词\n"
+                "- 数据：中文评论标注数据\n"
+                "- 适用：中文评论、反馈、影评等"
+            )
+        else:
+            st.info(
+                "**English BiLSTM Sentiment Model**\n\n"
+                "- Framework: PyTorch\n"
+                "- Architecture: Embedding + BiLSTM + FC\n"
+                "- Parameters: ~738K\n"
+                "- Test Accuracy: 97.0%\n"
+                "- Data: 1166 movie reviews"
+            )
 
     # ── 情感分析主界面 ──
-    st.title("😊 文本情感分析")
-    st.caption("基于 PyTorch BiLSTM 模型 ｜ 本地推理 ｜ 二分类（正面/负面）")
+    if is_chinese:
+        st.title("😊 中文文本情感分析")
+        st.caption("基于 PyTorch BiLSTM 模型 ｜ 字符级分词 ｜ 二分类（正面/负面）")
+    else:
+        st.title("😊 Text Sentiment Analysis")
+        st.caption("PyTorch BiLSTM | Local inference | Binary classification")
 
-    # 懒加载模型
-    if st.session_state.sentiment_predictor is None:
+    # 懒加载对应语言的模型
+    predictor_key = "chinese_predictor" if is_chinese else "sentiment_predictor"
+    if st.session_state.get(predictor_key) is None:
         try:
-            from sentiment_analysis.predict import SentimentPredictor
-            with st.spinner("正在加载情感分析模型..."):
-                st.session_state.sentiment_predictor = SentimentPredictor()
+            if is_chinese:
+                from sentiment_analysis.predict import ChineseSentimentPredictor
+                with st.spinner("正在加载中文情感分析模型..."):
+                    st.session_state.chinese_predictor = ChineseSentimentPredictor()
+            else:
+                from sentiment_analysis.predict import SentimentPredictor
+                with st.spinner("Loading sentiment model..."):
+                    st.session_state.sentiment_predictor = SentimentPredictor()
             st.success("✅ 模型加载成功")
         except Exception as e:
             st.error(f"模型加载失败：{e}")
-            st.info("请先运行 `python -m sentiment_analysis.train` 训练模型。")
+            if is_chinese:
+                st.info("请先运行 `python -m sentiment_analysis.train_chinese` 训练中文模型。")
+            else:
+                st.info("请先运行 `python -m sentiment_analysis.train` 训练模型。")
             st.stop()
 
-    predictor = st.session_state.sentiment_predictor
+    predictor = st.session_state[predictor_key]
 
     # 示例文本
-    examples = [
-        "This movie is absolutely wonderful and I loved every minute of it",
-        "This movie is terrible and I hated every minute of it",
-        "The acting was superb but the story was a bit slow",
-        "I cannot believe I wasted two hours on this garbage",
-        "A heartwarming tale that restores your faith in humanity",
-        "One of the best films I have ever seen, truly inspiring",
-        "A complete waste of time and money, avoid at all costs",
-    ]
+    if is_chinese:
+        examples = [
+            "这家酒店环境很好，房间干净整洁，服务员态度热情",
+            "外卖送餐速度很慢，饭菜都凉了，味道也一般",
+            "这部电影太精彩了，剧情紧凑，演员演技在线",
+            "商品质量很差，和描述的不一样，物流也慢",
+            "餐厅环境优雅，菜品美味，服务周到",
+            "手机卡顿严重，拍照效果差，电池续航短",
+        ]
+        placeholder_text = "例如：这家酒店环境很好，服务很热情..."
+        input_label = "输入需要分析的中文文本"
+        analyze_label = "🔍 分析情感"
+        example_label = "加载示例"
+        use_example_label = "📋 使用此示例"
+        result_title = "📊 分析结果"
+        batch_title = "📦 批量分析（每行一条）"
+        batch_placeholder = "文本1\n文本2\n文本3"
+        footer_text = "🧠 基于 PyTorch BiLSTM 中文情感模型，适用于中文评论、反馈、影评等文本。"
+    else:
+        examples = [
+            "This movie is absolutely wonderful and I loved every minute of it",
+            "This movie is terrible and I hated every minute of it",
+            "The acting was superb but the story was a bit slow",
+            "I cannot believe I wasted two hours on this garbage",
+            "A heartwarming tale that restores your faith in humanity",
+            "A complete waste of time and money, avoid at all costs",
+        ]
+        placeholder_text = "e.g., This movie is absolutely wonderful..."
+        input_label = "Enter text to analyze"
+        analyze_label = "🔍 Analyze"
+        example_label = "Examples"
+        use_example_label = "📋 Use example"
+        result_title = "📊 Result"
+        batch_title = "📦 Batch analysis (one per line)"
+        batch_placeholder = "text1\ntext2\ntext3"
+        footer_text = "🧠 PyTorch BiLSTM model trained on English movie reviews."
 
     # 输入区域
-    st.subheader("📝 输入文本")
+    st.subheader("📝 " + (input_label if is_chinese else input_label))
     input_text = st.text_area(
-        "输入需要分析的英文文本（支持多行）",
+        input_label,
         height=100,
-        placeholder="例如：This movie is absolutely wonderful...",
-        key="sentiment_input",
+        placeholder=placeholder_text,
+        key=f"sentiment_input_{'zh' if is_chinese else 'en'}",
     )
 
     col_a, col_b, col_c = st.columns([1, 1, 3])
     with col_a:
-        analyze_clicked = st.button("🔍 分析情感", use_container_width=True, type="primary")
+        analyze_clicked = st.button(analyze_label, use_container_width=True, type="primary")
     with col_b:
         example_idx = st.selectbox(
-            "加载示例",
+            example_label,
             options=range(len(examples)),
-            format_func=lambda i: f"示例 {i+1}",
-            key="example_selector",
+            format_func=lambda i: f"{'示例' if is_chinese else 'Example'} {i+1}",
+            key=f"example_selector_{'zh' if is_chinese else 'en'}",
         )
     with col_c:
-        if st.button("📋 使用此示例", use_container_width=True):
-            st.session_state.sentiment_input = examples[example_idx]
+        if st.button(use_example_label, use_container_width=True):
+            st.session_state[f"sentiment_input_{'zh' if is_chinese else 'en'}"] = examples[example_idx]
             st.rerun()
 
     # 分析结果
     if analyze_clicked and input_text.strip():
-        with st.spinner("正在分析..."):
+        with st.spinner("正在分析..." if is_chinese else "Analyzing..."):
             result = predictor.predict(input_text.strip())
 
-        st.subheader("📊 分析结果")
+        st.subheader(result_title)
 
-        # 结果卡片
         is_positive = result["predicted_label"] == 1
         emoji = "😊" if is_positive else "😞"
         label_text = "正面 (Positive)" if is_positive else "负面 (Negative)"
-        color = "green" if is_positive else "red"
 
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("预测结果", f"{emoji} {label_text}")
+            st.metric("预测结果" if is_chinese else "Prediction", f"{emoji} {label_text}")
         with col2:
-            st.metric("置信度", f"{result['confidence']:.2%}")
+            st.metric("置信度" if is_chinese else "Confidence", f"{result['confidence']:.2%}")
 
         # 概率条形图
-        st.subheader("类别概率分布")
+        st.subheader("类别概率分布" if is_chinese else "Probability distribution")
         for cls_name, prob in result["probabilities"].items():
             is_pred = cls_name == result["predicted_class"]
             label = f"**{cls_name}**" if is_pred else cls_name
             st.markdown(f"{label}  —  `{prob:.2%}`")
             st.progress(prob)
 
-        # 原始文本回显
-        with st.expander("查看输入文本"):
+        with st.expander("查看输入文本" if is_chinese else "View input"):
             st.write(input_text.strip())
 
     elif analyze_clicked:
-        st.warning("请先输入要分析的文本。")
+        st.warning("请先输入要分析的文本。" if is_chinese else "Please enter text first.")
 
     # 批量分析
     st.divider()
-    with st.expander("📦 批量分析（每行一条）"):
+    with st.expander(batch_title):
         batch_text = st.text_area(
-            "输入多条文本，每行一条",
+            "输入多条文本，每行一条" if is_chinese else "Enter multiple texts, one per line",
             height=120,
-            placeholder="文本1\n文本2\n文本3",
+            placeholder=batch_placeholder,
+            key=f"batch_input_{'zh' if is_chinese else 'en'}",
         )
-        if st.button("批量分析", use_container_width=True):
+        if st.button("批量分析" if is_chinese else "Analyze batch", use_container_width=True):
             if batch_text.strip():
                 lines = [l.strip() for l in batch_text.strip().split("\n") if l.strip()]
                 results = predictor.predict_batch(lines)
                 st.dataframe(
                     [
                         {
-                            "文本": r["text"][:50] + ("..." if len(r["text"]) > 50 else ""),
-                            "预测": r["predicted_class"],
-                            "置信度": f"{r['confidence']:.2%}",
+                            "文本" if is_chinese else "Text": r["text"][:50] + ("..." if len(r["text"]) > 50 else ""),
+                            "预测" if is_chinese else "Prediction": r["predicted_class"],
+                            "置信度" if is_chinese else "Confidence": f"{r['confidence']:.2%}",
                         }
                         for r in results
                     ],
                     use_container_width=True,
                 )
             else:
-                st.warning("请输入至少一条文本。")
+                st.warning("请输入至少一条文本。" if is_chinese else "Please enter at least one text.")
 
     st.divider()
-    st.caption("🧠 基于 PyTorch BiLSTM 模型，训练数据为英文影评，适用于英文文本情感分析。")
+    st.caption(footer_text)
