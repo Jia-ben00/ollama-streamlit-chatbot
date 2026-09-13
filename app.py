@@ -51,10 +51,38 @@ def init_session_state():
         st.session_state.available_models = []
     if "sentiment_predictor" not in st.session_state:
         st.session_state.sentiment_predictor = None
+    if "chinese_predictor" not in st.session_state:
+        st.session_state.chinese_predictor = None
+    if "auto_detect_done" not in st.session_state:
+        st.session_state.auto_detect_done = False
+
+
+def auto_detect_ollama():
+    """启动时自动检测 Ollama 服务和本地模型，自动匹配可用模型。"""
+    if st.session_state.auto_detect_done:
+        return
+    st.session_state.auto_detect_done = True
+
+    chatbot = st.session_state.chatbot
+    try:
+        if chatbot.client.check_health():
+            st.session_state.ollama_available = True
+            models = chatbot.get_available_models()
+            st.session_state.available_models = models
+
+            # 如果默认模型不在本地列表中，自动切换到第一个可用模型
+            default_model = chatbot.client.config.model
+            if models and default_model not in models:
+                chatbot.set_model(models[0])
+        else:
+            st.session_state.ollama_available = False
+    except Exception:
+        st.session_state.ollama_available = False
 
 
 init_session_state()
 chatbot: ChatBot = st.session_state.chatbot
+auto_detect_ollama()
 
 
 # ── 侧边栏：模式选择 ──────────────────────────────────────
@@ -80,30 +108,46 @@ if mode == "💬 智能聊天":
             st.session_state.ollama_available = chatbot.client.check_health()
             if st.session_state.ollama_available:
                 st.session_state.available_models = chatbot.get_available_models()
+                # 自动匹配可用模型
+                if st.session_state.available_models:
+                    default_model = chatbot.client.config.model
+                    if default_model not in st.session_state.available_models:
+                        chatbot.set_model(st.session_state.available_models[0])
             else:
                 st.session_state.available_models = []
 
         if st.session_state.ollama_available is True:
-            st.success("✅ Ollama 服务已连接")
+            model_count = len(st.session_state.available_models)
+            st.success(f"✅ Ollama 服务已连接（{model_count} 个模型）")
         elif st.session_state.ollama_available is False:
             st.error("❌ 无法连接 Ollama 服务")
             st.info("请确保本地已安装并启动 Ollama：\n```\nollama serve\n```")
         else:
-            st.info("点击上方按钮检测连接")
+            st.info("正在自动检测...")
 
         st.divider()
 
         # 模型选择
         st.subheader("模型设置")
-        models = st.session_state.available_models or [config.ollama.model]
-        selected_model = st.selectbox(
-            "选择模型",
-            options=models,
-            index=0,
-            help="从本地 Ollama 已安装的模型中选择",
-        )
-        if selected_model:
-            chatbot.set_model(selected_model)
+        models = st.session_state.available_models
+        if models:
+            # 确保当前模型在列表中，否则自动选第一个
+            current = chatbot.current_model
+            if current not in models:
+                chatbot.set_model(models[0])
+                current = models[0]
+            selected_model = st.selectbox(
+                "选择模型",
+                options=models,
+                index=models.index(current) if current in models else 0,
+                help="从本地 Ollama 已安装的模型中选择",
+            )
+            if selected_model:
+                chatbot.set_model(selected_model)
+        else:
+            st.warning("⚠️ 未检测到本地模型")
+            st.info("请先拉取模型，例如：\n```\nollama pull deepseek-r1:1.5b\n```")
+            st.caption(f"当前配置的默认模型：`{config.ollama.model}`")
 
         st.divider()
 
