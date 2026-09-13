@@ -38,6 +38,8 @@ ENV/
 
 # Streamlit
 .streamlit/secrets.toml
+.agents/
+.claude/
 
 # OS
 .DS_Store
