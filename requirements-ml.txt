@@ -1,0 +1,6 @@
+# 情感分析模块专用依赖（PyTorch BiLSTM）
+# 安装：pip install -r requirements-ml.txt
+# 体积约 2-3GB，只在需要跑情感分析时安装
+-r requirements.txt
+torch>=2.0.0
+numpy>=1.24.0

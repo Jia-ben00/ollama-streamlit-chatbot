@@ -1,5 +1,7 @@
 # 🤖 AI 工具箱：智能聊天 + 情感分析
 
+[![CI](https://github.com/Jia-ben00/ollama-streamlit-chatbot/actions/workflows/ci.yml/badge.svg)](https://github.com/Jia-ben00/ollama-streamlit-chatbot/actions/workflows/ci.yml)
+
 基于 **Python + Ollama + Streamlit + PyTorch** 构建的本地 AI 应用，包含两大功能模块：
 
 1. **💬 智能聊天** — 基于 Ollama 本地大模型的网页版对话系统
@@ -32,9 +34,12 @@
 ## 🏗️ 项目结构
 
 ```
-ai-toolbox/
+ollama-streamlit-chatbot/
 ├── app.py                          # Streamlit 主应用（双模式切换）
-├── requirements.txt                # Python 依赖
+├── requirements.txt                # 运行依赖（聊天模块，不含 torch）
+├── requirements-ml.txt             # 情感分析依赖（含 torch / numpy）
+├── start.bat                       # Windows 一键启动脚本（自动探测解释器）
+├── .github/workflows/ci.yml        # CI：单测 + 语法检查
 ├── .env.example                    # 环境变量示例
 ├── .gitignore
 ├── README.md
@@ -47,17 +52,19 @@ ai-toolbox/
 ├── sentiment_analysis/             # 情感分析模块
 │   ├── __init__.py
 │   ├── config.py                   # 模型超参数配置
-│   ├── dataset.py                  # 数据集加载与预处理（含内置数据）
+│   ├── dataset.py                  # 英文数据集加载与预处理（含内置数据）
+│   ├── dataset_chinese.py          # 中文数据集加载与预处理
 │   ├── model.py                    # BiLSTM 模型定义
-│   ├── train.py                    # 训练脚本
+│   ├── train.py                    # 英文模型训练脚本
+│   ├── train_chinese.py            # 中文模型训练脚本
 │   ├── evaluate.py                 # 评估脚本（准确率/精确率/召回率/F1/混淆矩阵）
 │   ├── predict.py                  # 单条/批量推理脚本
-│   ├── data/                       # 数据目录
-│   ├── models/                     # 模型定义目录
 │   └── checkpoints/                # 训练好的模型权重
-│       ├── bilstm_sentiment.pt     # 最佳模型检查点
-│       ├── vocab.json              # 词汇表
-│       └── training_history.json   # 训练历史
+│       ├── bilstm_sentiment.pt             # 英文最佳模型检查点
+│       ├── bilstm_chinese_sentiment.pt     # 中文最佳模型检查点
+│       ├── vocab.json                      # 英文词汇表
+│       ├── vocab_chinese.json              # 中文词汇表
+│       └── training_history.json           # 训练历史
 ├── tests/
 │   ├── __init__.py
 │   └── test_chatbot.py             # 聊天模块单元测试（31 个用例）
@@ -72,7 +79,7 @@ ai-toolbox/
 
 1. **Python 3.10+**
 2. **Ollama**（仅聊天模块需要）— 从 [ollama.com](https://ollama.com/) 下载安装
-3. **PyTorch**（情感分析模块需要）
+3. **PyTorch**（仅情感分析模块需要，约 2–3GB，单独安装）
 
 ### 安装与运行
 
@@ -86,7 +93,7 @@ python -m venv venv
 venv\Scripts\activate          # Windows
 # source venv/bin/activate     # macOS/Linux
 
-# 3. 安装依赖
+# 3. 安装运行依赖（不含 PyTorch，约几十 MB）
 pip install -r requirements.txt
 
 # 4. 启动应用
@@ -94,6 +101,31 @@ streamlit run app.py
 ```
 
 启动后浏览器自动打开 `http://localhost:8501`，在左侧边栏切换「智能聊天」和「情感分析」模式。
+
+> **只想跑聊天模块？** 到此为止即可。PyTorch 只在情感分析模块里被 `import`，
+> 所以不装它也能正常启动和对话 —— 这也是 CI 跑得飞快（< 1 分钟）的原因。
+
+### Windows 一键启动
+
+```bat
+start.bat
+```
+
+脚本不写死解释器路径，按 `PYTHON_EXE` 环境变量 → `py -3` → PATH 上的 `python` 顺序探测，
+依赖缺失时会提示是否自动安装：
+
+```bat
+set PYTHON_EXE=C:\Python312\python.exe
+start.bat
+```
+
+### 安装情感分析依赖（PyTorch）
+
+```bash
+pip install -r requirements-ml.txt
+```
+
+它会先装 `requirements.txt` 的内容，再补上 `torch` 和 `numpy`。
 
 ### 安装 GPU 版 PyTorch（可选，加速训练）
 
@@ -196,9 +228,16 @@ python -m sentiment_analysis.predict
 ## 🧪 运行测试
 
 ```bash
-# 聊天模块单元测试（31 个用例，mock 离线运行）
+# 聊天模块单元测试（31 个用例，mock 离线运行，不需要 Ollama）
 python -m unittest discover tests -v
 ```
+
+### CI
+
+`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **31 passed**。
+
+CI 里刻意**只装 `requirements.txt`**（不含 torch），并有一条 guard 步骤会在 torch 意外出现时直接失败：
+装了 torch 的话每次 run 要多下 2–3GB，这正是「本地跑通 ≠ CI 跑通」最常见的坑。
 
 ---
 
@@ -213,6 +252,7 @@ python -m unittest discover tests -v
 | HTTP 客户端 | requests |
 | 配置管理 | python-dotenv + dataclasses |
 | 测试 | unittest + mock |
+| CI | GitHub Actions（ubuntu-latest / Python 3.11） |
 
 ---
 
