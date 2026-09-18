@@ -40,6 +40,7 @@ ENV/
 .streamlit/secrets.toml
 .agents/
 .claude/
+.workbuddy/
 
 # OS
 .DS_Store
