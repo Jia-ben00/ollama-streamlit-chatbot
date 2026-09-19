@@ -176,6 +176,31 @@ server {
 应用主动告诉 Nginx 别缓冲，配置层再显式关一次。漏了会怎样见
 `docs/interview-notes.md` 第 5 节（那里有一个同类坑的实测数据）。
 
+### 6.1 配完之后怎么验（只看行为，不看配置）
+
+```bash
+python tests/e2e/public_check.py --url https://your-domain.com
+```
+
+**要在另一台机器上跑**（不是服务器上）：服务器上直连 8000 不经过 Nginx，
+验不到反代这一层，等于没验。
+
+它用裸 socket 记录每块的真实到达时刻，判定回复是不是「逐块到达」。两种失败形态都拦得住：
+9 块全挤在几毫秒内（中间那层攒批）、首块直到最后才出现（上游生成完才吐）。
+
+这个失败模式在本地就能复现——`tests/e2e/buffering_proxy.py` 是一个**故意攒批**的替身反代
+（它像 `proxy_buffering on` 一样把响应读完再一次性发出），拿它当靶子应当**变红**：
+
+```bash
+python tests/e2e/buffering_proxy.py                                      # 终端 A
+python tests/e2e/public_check.py --url http://127.0.0.1:8100 --no-ports   # 终端 B → 流式那条 FAIL
+```
+
+⚠️ 一个容易搞反的点：`X-Accel-Buffering` 是应用发给**反代**看的头，经 Nginx 之后
+很可能根本到不了客户端（我们**没有**在真 Nginx 上验证过这一点）。
+所以公网侧的判据只能是**到达时刻**；「响应头里有 X-Accel-Buffering」是**应用侧**单测的断言
+（`tests/test_chat_stream.py`），别把它搬到公网侧来用。
+
 ## 7. 排查：第一次上云大概率会撞上的
 
 | 现象 | 原因 / 怎么办 |
@@ -196,9 +221,19 @@ server {
 
 ## 7.5 上线后跑一次验收
 
+**第一步，在服务器上**（验「容器化部署」本身）：
+
 ```bash
 bash .github/scripts/container_smoke.sh
 ```
+
+**第二步，从外面验公网入口**（这一步上面那个脚本盖不住——它跑在服务器本机，不经过 Nginx）：
+
+```bash
+python tests/e2e/public_check.py --url https://your-domain.com
+```
+
+三个验收脚本的分工（本机 / 服务器上 / 从外面）见 `tests/e2e/README.md`。
 
 和 CI 里跑的是同一份脚本。它会逐项断言「容器化部署真的成立」，包括那些
 静态校验证明不了的：镜像里没有凭据、容器非 root、数据库端口没暴露、
