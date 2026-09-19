@@ -187,12 +187,57 @@ python -m unittest tests.test_schema_snapshot
 导出脚本**显式写 LF**（`newline="\n"`）：`Path.write_text` 在 Windows 上会把 `\n`
 翻成 `\r\n`，同一份快照在两个平台上导出就会字节不同，diff 里全是噪音。
 
+## 公网入口验收：`public_check.py`（+ 它的靶子 `buffering_proxy.py`）
+
+```bash
+# 从**外面**打（你的笔记本），不经过反代的直连也行
+python tests/e2e/public_check.py --url https://your-domain.com
+
+# 本地自测用
+python tests/e2e/public_check.py --url http://127.0.0.1:8000 --no-ports
+```
+
+三个验收脚本的分工是**刻意分开**的，别混：
+
+| 脚本 | 在哪跑 | 回答什么问题 |
+|---|---|---|
+| `smoke.py` | 本机 | 这套代码拼起来能跑吗（真 MySQL + 假 Ollama，不经反代） |
+| `.github/scripts/container_smoke.sh` | 服务器上 | **容器化部署**成立吗（镜像无凭据、非 root、端口不外露） |
+| `public_check.py` | **从外面** | **公网入口**成立吗（经 Nginx/HTTPS 之后，流式还是真流式吗） |
+
+三个里只有最后一个能发现「反代把流攒批了」这一类问题 —— 而它恰恰是**最不容易被发现**的：
+功能完全正常、接口返回正确、落库也对，只是用户看到的从「一个字一个字蹦」变成
+「转圈等到最后出全文」。没有报错、没有告警，只有**到达时刻**能看出来。
+
+所以 `public_check.py` 用裸 socket 记录每块的真实到达时刻，判据在 `src/stream_probe.py`
+（那个判据本身也有单测和反向对照，见下）。
+
+`buffering_proxy.py` 是**故意攒批**的替身反代（模拟 `proxy_buffering on`：把上游响应
+读完再一次性发，并且像 Nginx 一样不把 `X-Accel-Buffering` 转发给客户端）。
+本机没有 Docker / Nginx，没有它就没法复现这个失败模式：
+
+```bash
+python tests/e2e/buffering_proxy.py                                       # 终端 A
+python tests/e2e/public_check.py --url http://127.0.0.1:8100 --no-ports    # 终端 B → 流式那条必须 FAIL
+```
+
+实测对照（两边同一份代码，只差中间那一层）：
+
+| 路径 | 观测 | 判定 |
+|---|---|---|
+| 直连 8000 | 9 块分布在 0.404s，首块 0.055s 到达 | ✅ INCREMENTAL |
+| 经攒批替身 8100 | 9 块全挤在 0.000s，首块 0.500s 到达（总 0.500s） | ❌ BUFFERED |
+
+⚠️ 端口检查那部分自带**控制组**：先探一个已知开放的端口，连不上就直接报「探针自检失败」，
+而不是把后面几个「连不上」当成「安全」—— 否则结论就建立在「什么都没读到」上（假绿）。
+
 ## 反向对照：证明「守卫真的会红」
 
 ```bash
-python tests/e2e/reverse_check.py                  # 三个分组都跑
+python tests/e2e/reverse_check.py                  # 四个分组都跑
 python tests/e2e/reverse_check.py schema           # 只跑一组
 python tests/e2e/reverse_check.py container_smoke  # 只跑一组
+python tests/e2e/reverse_check.py stream_probe     # 只跑一组
 ```
 
 **「测试全绿」不能证明测试有效** —— 断言写松了、写成恒真条件，一样全绿。
@@ -203,6 +248,17 @@ python tests/e2e/reverse_check.py container_smoke  # 只跑一组
 | `chat_stream` | Content-Type / 防缓冲头 / SSE 空行分帧 / done 字段 / 404 校验 / 断连报错 / latency_ms 落库 | 7/7 全红 |
 | `schema` | 缺列 / 类型 / 枚举取值 / 可空性 / 索引 / 字符集声明 / 符号台账 / 快照少一张表 | 8/8 全红 |
 | `container_smoke` | 端口断言不等就绪 / 丢空状态健全性检查 / 端口缺失不再失败 | 3/3 全红 |
+| `stream_probe` | 尺子不判跨度 / 块数不足当通过 / 尺子不判首块位置 / 阈值参数不接线 | 4/4 全红 |
+
+**后两组守的不是业务代码，而是判据本身** —— 一个量不出东西的尺子，
+和一个量出「一切正常」的尺子长得一模一样。`stream_probe` 那把尤其值得守：
+它错的时候部署是**能用的**，只是从「一个个蹦字」变成「转圈等到最后出全文」。
+
+> 这一组第一次跑就抓到了自己的问题：**「尺子不判跨度」那条变异没变红**——
+> 现实样本里「一起到达」几乎总伴随「首块来得太晚」，于是另一条判据先命中了，
+> 把跨度判据遮住了。也就是说当时**没有任何一条用例能单独钉住跨度判据**。
+> 补了一个隔离样本（3 块挤在 4ms 内、但首块相对总耗时很早）才把它钉住。
+> 这就是为什么「守卫要能被证明会红」——读代码是看不出来的。
 
 最后一组值得单独说一句：它守的不是 Python 代码，而是 `container_smoke.sh` 里
 **api 端口那条断言的等待逻辑**。那条断言原本是「立刻 inspect，没有 HostPort 就失败」，

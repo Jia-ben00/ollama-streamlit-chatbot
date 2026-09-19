@@ -5,12 +5,19 @@
 「测试全绿」本身不能证明测试有效 —— 断言写松了、写成恒真条件，一样全绿。
 唯一可靠的判据是：把缺陷种回去，看它会不会失败。
 
-本脚本覆盖两组：
-- `chat_stream`：`api/routers/chat.py` 的流式协议（Content-Type / 防缓冲头 /
-  SSE 空行分帧 / done 字段 / 404 校验 / 断连报错 / latency_ms 落库），
-  对应 `tests/test_chat_stream.py`
-- `schema`：ORM 定义与快照（缺列 / 类型 / 枚举取值 / 可空性 / 索引 /
-  字符集声明 / 符号台账 / 快照少表），对应 `tests/test_schema_snapshot.py`
+本脚本覆盖四组：
+
+| 分组 | 被测对象 | 对应用例 |
+|---|---|---|
+| `chat_stream` | `api/routers/chat.py` 的流式协议（Content-Type / 防缓冲头 / SSE 空行分帧 / done 字段 / 404 校验 / 断连报错 / latency_ms 落库） | `tests/test_chat_stream.py` |
+| `schema` | ORM 定义与快照（缺列 / 类型 / 枚举取值 / 可空性 / 索引 / 字符集声明 / 符号台账 / 快照少表） | `tests/test_schema_snapshot.py` |
+| `container_smoke` | `.github/scripts/container_smoke.sh` 的端口断言等待逻辑 | `tests/test_container_smoke_script.py` |
+| `stream_probe` | `src/stream_probe.py` 的「流式有没有退化成攒批」判据 | `tests/test_stream_probe.py` |
+
+最后两组守的都不是业务代码，而是**判据本身**：一个量不出东西的尺子，
+和一个量出「一切正常」的尺子长得一模一样。`stream_probe` 那把尤其值得守——
+它错的时候部署是「能用的」，只是从「一个个蹦字」变成「转圈等到最后出全文」，
+没有报警、没有异常，只有到达时刻能看出来。
 
 ## 设计上的三条硬要求
 
@@ -79,6 +86,18 @@ HEALTH_TCP_CHECK = r'''  echo "$ports" | grep -q 'tcp' \
 API_PORT_DIE = r'''echo "$api_ports" | grep -q 'HostPort' \
   || die "等了 ${PORT_WAIT_SECS}s，api 仍没有映射到宿主机的端口，外部访问不到（ports=$api_ports）"'''
 
+# ── stream_probe 组的锚点 ────────────────────────────────────────
+# 这一组被测的是「公网入口那把尺子」本身：src/stream_probe.py 里判断
+# 「回复还是不是逐块到达」的判据。为什么尺子也要做反向对照 ——
+# 一把永远返回「流式正常」的尺子，会让 `proxy_buffering on` 这种部署一路绿灯，
+# 而它的表现只是「从一个个蹦字变成转圈等到最后出全文」，功能上没人会报警。
+PROBE = REPO / "src" / "stream_probe.py"
+TSP = "tests.test_stream_probe"
+
+SPAN_RULE = '    if metrics["span"] < min_span:'
+FIRST_RULE = '    if float(metrics["first"] or 0.0) > first_ratio * max(total, 1e-9):'
+INCONCLUSIVE_BRANCH = "            INCONCLUSIVE,\n            metrics,"
+
 GROUPS = {
     "chat_stream": [
         ("SSE Content-Type", CHAT,
@@ -137,6 +156,24 @@ GROUPS = {
         ("端口缺失不再失败", CS, API_PORT_DIE,
          '''echo "$api_ports" | grep -q 'HostPort' || true''',
          TCS + ".TestContainerSmokePortWait.test_端口始终没有映射时应失败"),
+    ],
+    "stream_probe": [
+        # ① 不判「跨度」——最典型的假修法：块数、内容、Content-Type 全对，只是全挤在一起。
+        #    注意钉的是**隔离样本**那条用例：现实样本往往同时触发「首块位置」判据，
+        #    会把这个变异遮住（第一版就是这么漏过去的）。
+        ("尺子不判跨度", PROBE, SPAN_RULE, "    if False:  # 缺陷种回：攒批不再判红",
+         TSP + ".TestVerdicts.test_one_burst_early_in_the_stream_is_buffered"),
+        # ② 块数不足时判「通过」——把「量不出来」说成「没问题」
+        ("块数不足当通过", PROBE, INCONCLUSIVE_BRANCH,
+         "            INCREMENTAL,\n            metrics,",
+         TSP + ".TestVerdicts.test_too_few_chunks_is_inconclusive_not_pass"),
+        # ③ 不判「首块位置」——生成完再一次性吐出来的那种形态就漏了
+        ("尺子不判首块位置", PROBE, FIRST_RULE, "    if False:  # 缺陷种回：不判首块位置",
+         TSP + ".TestVerdicts.test_content_flushed_only_at_the_end_is_buffered"),
+        # ④ 阈值不接线：参数还在、还长得像配置，但判定读的是常量
+        ("阈值参数不接线", PROBE, SPAN_RULE,
+         '    if metrics["span"] < DEFAULT_MIN_SPAN:',
+         TSP + ".TestRulerIsNotBlind.test_thresholds_actually_participate"),
     ],
 }
 
