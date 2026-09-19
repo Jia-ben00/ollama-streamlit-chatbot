@@ -1,0 +1,55 @@
+# 公网入口的反向代理配置（HTTP）。
+#
+# 这是一个**模板**，不是能直接用的 nginx.conf。文件名和位置都有讲究：
+# nginx 官方镜像启动时会执行 /docker-entrypoint.d/20-envsubst-on-templates.sh，
+# 把 /etc/nginx/templates/*.template 里的变量占位符（写法见 docs/DEPLOY.md §6）
+# 用**容器环境变量**替换（只替换「环境里真实存在的变量」），输出到 /etc/nginx/conf.d/。
+#
+#   命名成 default.conf.template 是为了**覆盖**镜像自带的 /etc/nginx/conf.d/default.conf
+#   （那个只返回 "Welcome to nginx!"）。不覆盖的话会有两个 default server 抢同一个端口，
+#   nginx 直接起不来。
+#
+#   SERVER_NAME / API_UPSTREAM / LISTEN_PORT 会被替换成环境变量的值；
+#   而 $host / $remote_addr 这些 **nginx 自己的变量**不在环境里，原样保留。
+#   （替换的名字全大写是刻意的：nginx 的内置变量全是小写，两者不会撞名。）
+#
+# 为什么需要这一层、以及怎么验，见 docs/DEPLOY.md §6 / §6.1。
+
+server {
+    listen ${LISTEN_PORT};
+    server_name ${SERVER_NAME};
+
+    # ── SSE 的两道保险之一 ──────────────────────────────────────────
+    #
+    # 另一道在应用侧：/chat 的响应带 `X-Accel-Buffering: no`（见 api/routers/chat.py）。
+    #
+    # ⚠️ 说清楚这一句在我们的形态下到底起不起作用，别把它当成「救命的那一句」：
+    # 应用用 **chunked** 分帧（uvicorn 的默认），而 nginx 对 chunked 响应本来就不攒批 ——
+    # 实测开不开、有没有那个头，客户端观测到的到达时刻都一样。
+    # 留着它是因为零成本，而且它挡的是另外几种形态：上游不用 chunked、
+    # 开了 gzip（gzip 过滤器会攒）、开了 proxy_cache。
+    # 实测证据（nginx 1.27.4，同一台机器、只改一个变量）：上游「靠关连接表示结束」时，
+    # `proxy_buffering on` 会把 9 个块挤在 0.000s 一起发（客户端看到的是转圈等到最后
+    # 出全文），加上这一句就恢复成 9 块分布在 0.405s —— 完整表格见 docs/DEPLOY.md §6.1。
+    proxy_buffering off;
+    proxy_cache off;
+
+    location / {
+        proxy_pass http://${API_UPSTREAM};
+
+        # SSE 是长连接。用 HTTP/1.1 且**把 Connection 头置空**，nginx 才会对上游用
+        # keep-alive；否则每个事件之间都可能被当作「一次性请求」处理。
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 大模型生成慢（OLLAMA_TIMEOUT 默认 120s）。nginx 默认 60s 会在长回复上
+        # 提前掐断上游连接 —— 表现为「聊到一半断开」，而不是一条能看懂的报错。
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}

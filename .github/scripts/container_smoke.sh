@@ -17,6 +17,7 @@
 #   bash .github/scripts/container_smoke.sh              # 全自动：准备 .env、起假 Ollama、跑完清理
 #   KEEP=1 bash .github/scripts/container_smoke.sh       # 失败时保留容器，便于进去排查
 #   PYTHON=python3 bash .github/scripts/container_smoke.sh
+#   WITH_PROXY=0 bash .github/scripts/container_smoke.sh # 跳过「经真 nginx 的反代验收」
 #
 # 收尾的规矩（重要，涉及数据安全）
 # -------------------------------
@@ -34,7 +35,10 @@
 #   6. 容器内断言：凭据没进镜像 / 非 root / 数据库端口没暴露 / api 端口已暴露
 #   7. 等就绪 + 灌种子数据（必须 exec 进容器，因为 MySQL 刻意没对宿主机开端口）
 #   8. 从宿主机打发布端口跑端到端断言（tests/e2e/container_smoke.py）
-#   9. 失败时打印容器日志与状态，然后按上面的规矩收尾
+#   9. 起真 nginx 容器（用仓库里那份模板）接在 api 前面，量 SSE 的到达时刻，
+#      并用一个「必须被判成攒批」的反例证明这把尺子在这里量得出东西
+#      （tests/e2e/nginx_check.py；WITH_PROXY=0 可跳过）
+#  10. 失败时打印容器日志与状态，然后按上面的规矩收尾
 #
 # 一个反复出现的写法约定（本脚本里刻意保持）：**所有检查都 fail-closed**。
 # 不要写 `X="$(cmd | tail -1)"; [[ "$X" != "bad" ]]` 这种形式 ——
@@ -59,6 +63,11 @@ FAKE_PID=""
 # 刚 `deploy.sh` 完再拿本脚本做验收，无条件 down -v 就等于把线上库删了。
 # 所以：启动前已在跑 → 不动它，只做断言。
 PRE_EXISTING=0
+
+# 第 9 步「经真 nginx 的反代验收」是否要跑。
+# 它自己会起 nginx 容器（挂在 compose 网络上），**不需要** compose 的 proxy 服务先起来 ——
+# 所以这里不会去动 80 端口，也不会改变 compose 的形态。
+WITH_PROXY="${WITH_PROXY:-1}"
 
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
 warn() { printf '\033[1;33m[WARN] %s\033[0m\n' "$1"; }
@@ -95,7 +104,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── 1. 前置检查 ────────────────────────────────────────
-log "1/8 前置检查"
+log "1/9 前置检查"
 command -v docker >/dev/null 2>&1 || die "没有 docker。安装：curl -fsSL https://get.docker.com | sh"
 docker info >/dev/null 2>&1 || die "docker 守护进程不可用（或当前用户不在 docker 组）"
 docker compose version >/dev/null 2>&1 || die "缺少 docker compose 插件（要 docker compose，不是 docker-compose）"
@@ -106,7 +115,7 @@ echo "  compose: $(docker compose version --short 2>/dev/null || echo '?')"
 echo "  python:  $("$PYTHON" --version 2>&1)"
 
 # ── 2. 准备 .env ───────────────────────────────────────
-log "2/8 准备 .env"
+log "2/9 准备 .env"
 if [[ ! -f .env ]]; then
   cp .env.prod.example .env
   echo "  已从 .env.prod.example 生成 .env"
@@ -138,7 +147,7 @@ if grep -qE '^MYSQL_ROOT_PASSWORD=.*@' .env; then
 fi
 
 # ── 3. 校验 compose 配置 ───────────────────────────────
-log "3/8 校验 compose 配置（语法 + 变量插值）"
+log "3/9 校验 compose 配置（语法 + 变量插值）"
 docker compose config >/dev/null || die "docker compose config 失败（YAML 语法或变量插值有问题）"
 docker compose config | grep -q 'host-gateway' \
   || die "compose 里没有 extra_hosts: host-gateway，容器将无法解析 host.docker.internal"
@@ -152,7 +161,7 @@ if [[ -n "$(docker compose ps -q 2>/dev/null)" ]]; then
 fi
 
 # ── 4. 起假 Ollama ─────────────────────────────────────
-log "4/8 启动假 Ollama（绑 0.0.0.0:${FAKE_PORT}）"
+log "4/9 启动假 Ollama（绑 0.0.0.0:${FAKE_PORT}）"
 # 必须绑 0.0.0.0：容器里的 host.docker.internal 解析到的是宿主机在 docker 网桥上的
 # 地址（如 172.17.0.1），不是回环 127.0.0.1。只绑回环的话宿主机 curl 得通、
 # 容器连不上，报错还是 "Connection refused"，很容易误判成服务没起来。
@@ -176,13 +185,13 @@ fi
 ok "假 Ollama 在 0.0.0.0:${FAKE_PORT} 监听（pid=${FAKE_PID}）"
 
 # ── 5. 构建并启动整套服务 ──────────────────────────────
-log "5/8 构建镜像并启动（mysql / redis 健康后 api 才启动）"
+log "5/9 构建镜像并启动（mysql / redis 健康后 api 才启动）"
 docker compose up -d --build
 docker compose ps
 
 # ── 6. 容器内断言 ──────────────────────────────────────
 # 这些只能用 docker CLI 看，HTTP 层看不见，所以放在编排脚本而不是 python 断言里。
-log "6/8 容器内断言"
+log "6/9 容器内断言"
 
 # ① 凭据没有进镜像：.dockerignore 是否真的生效。
 #    注意这条和静态校验的区别：静态校验证明「.dockerignore 里写了 .env」，
@@ -251,7 +260,7 @@ echo "$api_ports" | grep -q 'HostPort' \
 ok "api 已向宿主机暴露端口（$api_ports）"
 
 # ── 7. 等就绪 + 灌种子数据 ─────────────────────────────
-log "7/8 等 API 就绪"
+log "7/9 等 API 就绪"
 API_PORT_EFFECTIVE="$(grep -E '^API_PORT=' .env | head -1 | cut -d= -f2- || true)"
 API_PORT_EFFECTIVE="${API_PORT_EFFECTIVE:-8000}"
 
@@ -295,7 +304,7 @@ finally:
 PY
 
 # ── 8. 端到端断言 ──────────────────────────────────────
-log "8/8 从宿主机打发布端口，跑端到端断言"
+log "8/9 从宿主机打发布端口，跑端到端断言"
 set +e
 API_BASE="http://127.0.0.1:${API_PORT_EFFECTIVE}" "$PYTHON" tests/e2e/container_smoke.py
 RC=$?
@@ -305,6 +314,28 @@ if [[ "$RC" -ne 0 ]]; then
   log "断言失败，打印诊断信息"
   dump_diagnostics
   exit "$RC"
+fi
+
+# ── 9. 经真 nginx 的反代验收 ───────────────────────────
+# 前 8 步全程没有反代。而「流式变成一次性」这类故障**只在多一层时才出现**，
+# 且出现时功能完全正常（接口对、数据也对，只是从「一个字一个字蹦」变成
+# 「转圈等到最后出全文」）—— 所以必须在真 nginx 上量一次到达时刻。
+#
+# 这一步还带一个**反例**（开着 proxy_buffering，上游换成靠关连接结束的
+# tests/e2e/plain_sse.py），要求它必须被判成攒批 —— 否则说明尺子在这一层恒真，
+# 正例的「通过」也就说明不了任何事。
+if [[ "$WITH_PROXY" == "1" ]]; then
+  log "9/9 经真 nginx 的反代验收（量到达时刻，不看配置文本）"
+  set +e
+  "$PYTHON" tests/e2e/nginx_check.py
+  RC=$?
+  set -e
+  if [[ "$RC" -ne 0 ]]; then
+    log "反代验收失败（容器已保留在下面打印的范围之外，可加 KEEP=1 重跑保留现场）"
+    exit "$RC"
+  fi
+else
+  warn "WITH_PROXY=0：跳过经真 nginx 的反代验收（上云前请务必单独跑一次）"
 fi
 
 log "容器冒烟全部通过"

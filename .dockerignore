@@ -40,6 +40,9 @@ app.py
 sentiment_analysis/
 tests/
 requirements-ml.txt
+# 反代配置是**运行时挂载**给 proxy 容器的（compose 的 volumes），
+# 不需要被 COPY 进 api 镜像 —— api 容器里没有任何东西会读它。
+deploy/
 
 # ── 文档与本地资源 ─────────────────────────────────────
 docs/

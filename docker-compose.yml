@@ -111,5 +111,41 @@ services:
       retries: 3
       start_period: 10s
 
+  # ── 可选的反向代理入口（HTTP）────────────────────────────────────
+  # 默认**不启动**：`profiles` 里的服务只在显式启用时才参与。
+  #   只用 API：        docker compose up -d
+  #   连反代一起起：    docker compose --profile proxy up -d
+  #
+  # 为什么不放在默认启动里：多数本地开发不需要它，而一旦默认起，就会多占 80 端口、
+  # 多拉一个镜像，还会让「直连 8000」和「经 80」两条路径在排查时混在一起。
+  # 上线时建议启用（见 docs/DEPLOY.md §6），因为 HTTPS、限流、真实 IP 都要在这一层做。
+  proxy:
+    image: nginx:1.27-alpine
+    profiles: ["proxy"]
+    restart: unless-stopped
+    environment:
+      # 这三个名字 = 模板里的占位符（deploy/nginx/templates/default.conf.template）。
+      # nginx 官方镜像启动时会跑 docker-entrypoint.d/20-envsubst-on-templates.sh，
+      # 把模板渲染到 /etc/nginx/conf.d/ —— 所以**配置的单一来源是仓库里那个模板**，
+      # 服务器上不需要手写 nginx.conf（手写的会在某次 git pull 后与仓库漂移）。
+      #
+      # 非 ASCII 域名不用管（nginx 的 server_name 本来就写 punycode）；
+      # 默认 `_` 是 catch-all，用 IP 直接访问也能命中。
+      SERVER_NAME: "${SERVER_NAME:-_}"
+      # 容器之间走 compose 内网服务名，不经过宿主机端口
+      API_UPSTREAM: "api:8000"
+      LISTEN_PORT: "${PROXY_HTTP_PORT:-80}"
+    volumes:
+      - ./deploy/nginx/templates:/etc/nginx/templates:ro
+    ports:
+      # 宿主机端口与容器内监听端口取同一个值（LISTEN_PORT 上面也是它），少一个概念。
+      - "${PROXY_HTTP_PORT:-80}:${PROXY_HTTP_PORT:-80}"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # nginx:alpine 是 busybox 基础镜像，自带 wget（不必为了一个探针再装 curl）。
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${PROXY_HTTP_PORT:-80}/health"]
+
 volumes:
   mysql_data:

@@ -259,13 +259,47 @@ class TestDockerfile(DeployManifestBase):
 
 
 class TestComposeTopology(DeployManifestBase):
-    def test_only_api_publishes_ports(self):
-        """不要把 3306/6379 暴露到宿主机：公网无密码 Redis 是典型的入侵入口。"""
+    # 允许发布端口的服务。只有这两个：api 是应用本身（直连调试 / 容器冒烟要用），
+    # proxy 是对外入口（它存在的意义就是对外）。其余一律不许。
+    PORT_PUBLISHING_SERVICES = {"api", "proxy"}
+
+    def test_internal_services_never_publish_ports(self):
+        """3306/6379 一旦发布到宿主机，公网上就是「数据库直接对外开放」。
+
+        白名单是**显式**的，不是「除了 proxy 都算」—— 后者将来谁把 3306 加进 proxy
+        也没人发现。
+        """
         for name, svc in self.services.items():
             with self.subTest(service=name):
-                if name == "api":
+                if name in self.PORT_PUBLISHING_SERVICES:
                     continue
-                self.assertNotIn("ports", svc, f"{name} 不该把端口发布到宿主机")
+                self.assertNotIn(
+                    "ports", svc,
+                    f"{name} 不该把端口发布到宿主机；如果确实需要，把它加进 "
+                    "PORT_PUBLISHING_SERVICES 并说明为什么安全",
+                )
+
+    def test_proxy_publishes_only_the_entry_port(self):
+        """反代是入口，发布端口是对的 —— 但不能顺手把内部端口也带出去。
+
+        端口是模板化的，所以不能靠「字符串里有没有 3306」来判断：真正的约束是
+        **它只引用自己的入口端口变量**。混进 API_PORT（或别的服务端口）就等于
+        把内部端口一起开到公网，而这在 compose 里看起来完全正常。
+        """
+        proxy = self.services.get("proxy")
+        if proxy is None:
+            self.skipTest("compose 里没有 proxy 服务")
+        specs = [str(x) for x in (proxy.get("ports") or [])]
+        self.assertTrue(specs, "proxy 没有发布端口，那它就不算入口")
+        for spec in specs:
+            with self.subTest(port=spec):
+                names = {m[0] for m in INTERP_RE.findall(spec)}
+                self.assertEqual(
+                    names, {"PROXY_HTTP_PORT"},
+                    f"proxy 的端口映射引用了 {sorted(names)}；只该引用 PROXY_HTTP_PORT",
+                )
+                for internal in ("3306", "6379"):
+                    self.assertNotIn(internal, spec, f"proxy 的映射里出现了内部端口 {internal}")
 
     def test_service_healthy_targets_have_healthcheck(self):
         """写了 condition: service_healthy，目标服务就必须真的定义 healthcheck。"""
