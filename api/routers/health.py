@@ -1,4 +1,4 @@
-"""健康检查路由：GET /health，三探针。
+"""健康检查路由：/health（存活）与 /health/ready（就绪）。
 
 面试会问：为什么一个 /health 要同时探 DB、Redis、Ollama 三个东西？
 
@@ -7,18 +7,24 @@
 - Redis 挂了 → 缓存降级（能跑但慢）；
 - Ollama 挂了 → 聊天核心功能废掉。
 
-如果 /health 只返回 200 表示「进程在」，负载均衡器/监控会误以为一切正常，
-把流量继续打到这个「半残」的实例上。所以健康检查要区分「存活」（liveness，
-进程在不在）和「就绪」（readiness，依赖齐不齐）。这里三个探针就是 readiness。
+所以健康检查要区分「存活」（liveness，进程在不在）和「就绪」（readiness，依赖齐不齐）：
+
+- `GET /health`：**存活 + 诊断**。只要进程能响应就返回 200，body 里逐项报告依赖状态。
+  为什么这里不返回 503：liveness 探针的语义是「要不要重启这个进程」。依赖挂了重启
+  进程是没用的（重启一百次 MySQL 也不会回来），反而会造成重启风暴。所以它只回答
+  「我还活着吗」，把「依赖好不好」放在 body 里供人排查。
+- `GET /health/ready`：**就绪**。三个依赖全通才返回 200，否则 503。
+  给「要不要把流量摘掉」这个决策用（K8s readinessProbe / 负载均衡后端探测 /
+  部署脚本轮询）。依赖没齐时返回 503，编排系统就不会往这个实例打流量。
 
 返回结构里每个依赖是独立的 ok 状态，而不是一个总开关——这样出问题时，
 一眼看出是哪个依赖挂了，而不是「整体 unhealthy」让你去猜。
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from fastapi import Depends
 
 from api.deps import get_db
 from cache import cache
@@ -30,10 +36,8 @@ router = APIRouter(tags=["health"])
 _ollama = OllamaClient()
 
 
-@router.get("/health")
-def health(db: Session = Depends(get_db)):
-    """三探针健康检查：DB / Redis / Ollama。"""
-
+def _probe(db: Session) -> dict:
+    """跑三个探针，返回逐项结果。两个端点共用，避免逻辑写两遍。"""
     # DB 探针：跑一个 SELECT 1。用 text() 执行裸 SQL 而非走 ORM，避免依赖任何表存在。
     db_ok = True
     try:
@@ -41,18 +45,30 @@ def health(db: Session = Depends(get_db)):
     except Exception:  # noqa: BLE001
         db_ok = False
 
-    redis_ok = cache.enabled  # 缓存初始化时已 ping 过；enabled 即代表可达。
-
-    ollama_ok = _ollama.check_health()
-
-    # HTTP 状态码：三个依赖都健康返回 200，否则返回 503（Service Unavailable）。
-    # 这样负载均衡器/编排系统（K8s readinessProbe）能据此摘掉不健康实例。
-    all_ok = db_ok and redis_ok and ollama_ok
     return {
-        "status": "ok" if all_ok else "degraded",
-        "checks": {
-            "database": db_ok,
-            "redis": redis_ok,
-            "ollama": ollama_ok,
-        },
+        "database": db_ok,
+        # 缓存初始化时已 ping 过；enabled 即代表可达。
+        "redis": cache.enabled,
+        "ollama": _ollama.check_health(),
     }
+
+
+@router.get("/health")
+def health(db: Session = Depends(get_db)):
+    """存活 + 诊断：进程能响应就 200，依赖状态放在 body 里逐项报告。"""
+    checks = _probe(db)
+    return {
+        "status": "ok" if all(checks.values()) else "degraded",
+        "checks": checks,
+    }
+
+
+@router.get("/health/ready")
+def readiness(db: Session = Depends(get_db)):
+    """就绪探针：依赖全通才 200，否则 503 —— 供编排系统决定要不要摘流量。"""
+    checks = _probe(db)
+    all_ok = all(checks.values())
+    return JSONResponse(
+        status_code=200 if all_ok else 503,
+        content={"status": "ready" if all_ok else "not_ready", "checks": checks},
+    )

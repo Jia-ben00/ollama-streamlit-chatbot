@@ -10,6 +10,22 @@ import requests
 
 from src.config import OllamaConfig, GenerationConfig
 
+# 读流式响应时的字节粒度（别用默认值，默认值会「攒批」）。
+#
+# 坑在哪：`requests.iter_lines()` 默认 chunk_size=512，而底层 `read(n)` 的语义是
+# 「攒够 n 字节再返回」。Ollama 一行 NDJSON 只有一百多字节，于是要攒够 3 行左右
+# 才交出来一次 —— 服务端明明每 50ms 推了一块，客户端却每 200ms 才收到一批。
+# 对用户来说，这就是「首字延迟变高 + 文字一段段蹦」。
+#
+# 实测（假 Ollama，固定每 50ms 吐一行；数据见 docs/interview-notes.md 的 SSE 一节）：
+#   chunk_size=512 -> 首块 156ms，到达间隔 [0,0,203,0,0,0,94,0,0] ms（三行一批）
+#   chunk_size=256 -> 首块  78ms，到达间隔 约 100ms 一批
+#   chunk_size=128 -> 首块  63ms，到达间隔均匀 47ms
+#   chunk_size=  1 -> 首块   0ms，到达间隔均匀 47ms，总耗时不变（453ms）
+# 所以这里取最小粒度：首字延迟最低，且每字节一次 read 的开销被 BufferedReader
+# 的内部缓冲吸收，实测总耗时与默认值完全一致。
+STREAM_READ_CHUNK = 1
+
 
 class OllamaClient:
     """Ollama REST API 客户端。"""
@@ -137,7 +153,9 @@ class OllamaClient:
             )
             resp.raise_for_status()
 
-            for line in resp.iter_lines(decode_unicode=True):
+            for line in resp.iter_lines(
+                chunk_size=STREAM_READ_CHUNK, decode_unicode=True
+            ):
                 if not line:
                     continue
                 try:

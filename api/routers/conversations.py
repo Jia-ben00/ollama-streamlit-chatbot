@@ -25,14 +25,14 @@ naive 做法（会触发 N+1）：
 relationship 懒加载。
 """
 
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from api.deps import get_db
-from api.schemas import ConversationCreate, ConversationOut
+from api.schemas import ConversationCreate, ConversationOut, MessageOut
 from db.models import Conversation, Message
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -104,6 +104,38 @@ def get_conversation(
     out = ConversationOut.model_validate(conv)
     out.message_count = count
     return out
+
+
+@router.get("/{conversation_id}/messages", response_model=List[MessageOut])
+def list_messages(
+    conversation_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    before_id: Optional[int] = Query(None, description="只取 id 小于它的消息（向前翻页游标）"),
+    db: Session = Depends(get_db),
+):
+    """拉取会话消息列表（默认最近 50 条，按时间正序返回）。
+
+    分页为什么用 `before_id` 游标而不是 `OFFSET`（面试加分点）：
+    - `LIMIT 50 OFFSET 500` 的语义是「先扫出前 550 行、丢掉前 500 行」。翻到越后面，
+      扫过的行越多，性能随页深线性退化，而且聊天场景是「一直往下滚」，页深没有上限。
+    - 游标分页（`WHERE id < :before_id ORDER BY id DESC LIMIT 50`）每次都从索引上
+      直接定位到起点，只读它需要的那 50 行，**任意页深成本恒定**。
+    - 附带好处：游标是「最后一条的 id」，用户往上滚时新消息插进来不会导致错位
+      （OFFSET 分页在有新数据写入时会漏行/重复行）。
+
+    返回前把倒序结果翻回正序，前端拿到就能直接按时间渲染，不用自己 reverse。
+    """
+    # 会话不存在时返回 404，而不是空列表——空列表会让前端误以为「会话存在但没消息」。
+    exists = db.query(Conversation.id).filter(Conversation.id == conversation_id).first()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    q = db.query(Message).filter(Message.conversation_id == conversation_id)
+    if before_id is not None:
+        q = q.filter(Message.id < before_id)
+
+    rows = q.order_by(Message.id.desc()).limit(limit).all()
+    return list(reversed(rows))
 
 
 @router.patch("/{conversation_id}", response_model=ConversationOut)

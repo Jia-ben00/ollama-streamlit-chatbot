@@ -1,0 +1,22 @@
+# 换行符策略：Windows 上编辑、Linux 上部署，不显式声明就一定会踩坑。
+#
+# 起因：`.sh` 如果在 Windows 上被转成 CRLF，Linux 上执行会报
+#   bash: ./deploy.sh: /bin/bash^M: bad interpreter: No such file or directory
+# 反过来 `.bat` 如果在 Linux 上被转成 LF，Windows cmd 的某些分支又会出错。
+# 所以按文件类型显式约定，让两个平台各拿自己需要的格式。
+
+# 默认：交给 Git 自己判断文本文件，检出时用平台默认换行
+* text=auto
+
+# shell 脚本必须是 LF —— 否则 Linux 上的 shebang 会带着 \r 一起解析
+*.sh text eol=lf
+
+# Windows 批处理必须是 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 这些是二进制，别做任何换行转换
+*.pt binary
+*.png binary
+*.jpg binary
+*.ico binary

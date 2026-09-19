@@ -13,6 +13,7 @@
 services:
   mysql:
     image: mysql:8.0
+    restart: unless-stopped
     environment:
       # 密码用环境变量注入（.env 提供），不把真实凭据写死进 compose 文件。
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-me}
@@ -20,8 +21,10 @@ services:
       # 显式指定 utf8mb4 字符集，和练习库 / ORM 对齐，避免容器默认 latin1 存不了中文。
       MYSQL_CHARSET: utf8mb4
       MYSQL_COLLATION: utf8mb4_0900_ai_ci
-    ports:
-      - "3306:3306"
+    # 故意不把 3306 映射到宿主机（公网上就是「给全世界开了一个数据库端口」）。
+    # 容器之间走 compose 内网服务名互访，根本不需要宿主机端口。
+    # 需要在服务器上手工连库调试时用：
+    #   docker compose exec mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" chatbot
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -34,17 +37,26 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+    # 同样不映射端口：Redis 默认无密码，暴露到公网等于把数据交出去
+    # （历史上大量 Redis 被写 SSH key / 挖矿就是这么来的）。
+    # 调试用：docker compose exec redis redis-cli
 
   api:
     build: .
+    restart: unless-stopped
     environment:
       # 容器内通过服务名 mysql / redis 互相访问（compose 自建网络 + DNS）。
       DATABASE_URL: "mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-change-me}@mysql:3306/chatbot?charset=utf8mb4"
-      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      # ⚠️ 必须显式给 REDIS_URL。cache.py 的默认值是 127.0.0.1:6379，而在容器里
+      # 127.0.0.1 指的是 api 容器自己 —— Redis 在另一个容器，用服务名 redis 才能解析。
+      # 少了这一行不会报错，只会静默降级成「永远不缓存」，是个很难发现的坑。
+      REDIS_URL: "redis://redis:6379/0"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-llama3.2}"
     ports:
-      - "8000:8000"
+      # 只暴露 API。端口可用 .env 里的 API_PORT 覆盖（默认 8000）。
+      - "${API_PORT:-8000}:8000"
     depends_on:
       mysql:
         condition: service_healthy
@@ -53,6 +65,22 @@ services:
     # api 启动后自动执行建表脚本，再起服务。
     command: >
       sh -c "python -m db.init_db && uvicorn api.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      # 探 /health（liveness）而不是 /health/ready（readiness）：
+      # docker 的 healthcheck 语义是「这个容器还正常吗」，依赖全不通时重启容器也没用，
+      # 反而会陷入 restart 循环。readiness 交给外层的编排/负载均衡去判断。
+      #
+      # 注意 python:3.11-slim 里没有 curl/wget（精简掉了），所以用 python 一行发请求，
+      # 不为一个探针去装额外工具。
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   mysql_data:

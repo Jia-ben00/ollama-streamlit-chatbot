@@ -2,12 +2,16 @@
 
 [![CI](https://github.com/Jia-ben00/ollama-streamlit-chatbot/actions/workflows/ci.yml/badge.svg)](https://github.com/Jia-ben00/ollama-streamlit-chatbot/actions/workflows/ci.yml)
 
-基于 **Python + Ollama + Streamlit + PyTorch** 构建的本地 AI 应用，包含两大功能模块：
+基于 **Python + Ollama + FastAPI + MySQL/Redis + PyTorch** 构建的本地 AI 应用，包含两层：
 
 1. **💬 智能聊天** — 基于 Ollama 本地大模型的网页版对话系统
 2. **😊 情感分析** — 基于 PyTorch BiLSTM 的文本情感分类模型
 
-所有 AI 推理均在本地完成，数据不上传云端，保护隐私。
+聊天部分已经从「Streamlit 单进程」改造为 **前后端分离**：FastAPI 提供 HTTP 层，
+MySQL 做消息持久化，Redis 缓存会话上下文，SSE 流式输出。所有 AI 推理仍在本地完成。
+
+- 部署手册：[docs/DEPLOY.md](docs/DEPLOY.md)
+- 面试自查（每个技术选型的理由 + 实测数据）：[docs/interview-notes.md](docs/interview-notes.md)
 
 ---
 
@@ -55,15 +59,21 @@ ollama-streamlit-chatbot/
 │   ├── schemas.py                  # Pydantic 请求/响应模型
 │   └── routers/
 │       ├── chat.py                 # POST /chat（SSE 流式）
-│       ├── conversations.py        # 会话 CRUD（显式 JOIN 防 N+1）
-│       └── health.py               # GET /health（DB/Redis/Ollama 三探针）
+│       ├── conversations.py        # 会话 CRUD + 消息列表（显式 JOIN 防 N+1、游标分页）
+│       └── health.py               # /health（存活+诊断）与 /health/ready（就绪）
 ├── db/                             # 数据层（SQLAlchemy ORM，后端化新增）
 │   ├── models.py                   # 6 张表的 ORM 映射（对齐本地 chatbot 库）
 │   ├── session.py                  # 引擎 + 连接池 + get_db()
 │   └── init_db.py                  # 建表脚本
-├── cache.py                        # Redis 会话上下文缓存
+├── cache.py                        # Redis 会话上下文缓存（连不上自动降级）
 ├── Dockerfile                      # 多阶段构建
 ├── docker-compose.yml              # api + mysql + redis（healthcheck + depends_on）
+├── deploy.sh                       # 云主机一键部署脚本
+├── .env.prod.example               # 生产环境变量模板
+├── .gitattributes                  # 换行符策略（sh 用 LF / bat 用 CRLF）
+├── docs/
+│   ├── DEPLOY.md                   # 部署手册（上云步骤 / 安全组 / 排查）
+│   └── interview-notes.md          # 面试自查：6 个必问点 + 实测数据
 ├── sentiment_analysis/             # 情感分析模块
 │   ├── __init__.py
 │   ├── config.py                   # 模型超参数配置
@@ -83,7 +93,8 @@ ollama-streamlit-chatbot/
 ├── tests/
 │   ├── __init__.py
 │   ├── test_chatbot.py             # 聊天模块单元测试（31 个用例）
-│   └── test_api.py                 # API 层测试（TestClient + mock）
+│   ├── test_api.py                 # API 层测试（TestClient + 假 Session）
+│   └── test_cache.py               # 缓存层测试（假 Redis，含降级行为）
 └── assets/
 ```
 
@@ -241,16 +252,72 @@ python -m sentiment_analysis.predict
 
 ---
 
+## 🌐 后端 API（后端化改造）
+
+原来的 Streamlit 应用是「进程内直接调 Ollama」，没有持久化、没有并发能力。这一层把它拆成
+**HTTP 层（FastAPI）+ 数据层（MySQL/SQLAlchemy）+ 缓存层（Redis）**，前端可以换、可以并存。
+
+### 本地起服务
+
+```bash
+# 1. 建库（MySQL 8.0 需要先跑着）
+mysql -uroot -p -e "CREATE DATABASE chatbot CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+
+# 2. 配置连接串（.env，已在 .gitignore 里，不会进仓库）
+#    DATABASE_URL=mysql+pymysql://root:<密码>@127.0.0.1:3306/chatbot?charset=utf8mb4
+
+# 3. 建表（读 db/models.py 的 ORM，幂等可重跑）
+python -m db.init_db
+
+# 4. 起服务
+uvicorn api.main:app --reload --port 8000
+```
+
+打开 `http://127.0.0.1:8000/docs` 可以直接在浏览器里调接口。
+
+### 接口一览
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 存活 + 诊断：永远 200，body 里逐项报告 DB / Redis / Ollama |
+| GET | `/health/ready` | 就绪：依赖全通才 200，否则 503（给编排系统摘流量用） |
+| POST | `/conversations` | 创建会话 |
+| GET | `/conversations?user_id=` | 会话列表（含消息数，单条 SQL 防 N+1） |
+| GET | `/conversations/{id}` | 单个会话 |
+| GET | `/conversations/{id}/messages` | 消息列表（游标分页 `before_id`，任意页深成本恒定） |
+| PATCH | `/conversations/{id}` | 归档（软删除） |
+| POST | `/chat` | **SSE 流式对话**，流结束后落 assistant 消息并记 `latency_ms` |
+
+### 容器化部署
+
+```bash
+cp .env.prod.example .env && vi .env    # 填 MYSQL_ROOT_PASSWORD
+bash deploy.sh                          # 构建 + 起服 + 轮询就绪 + 打印验证命令
+```
+
+详细步骤（安全组、Ollama 接法、Nginx 反代、故障排查、回滚）见 **[docs/DEPLOY.md](docs/DEPLOY.md)**。
+
+> 只暴露 API 端口：`docker-compose.yml` 故意不把 3306 / 6379 映射到宿主机 ——
+> 把无密码的 Redis 或数据库端口放到公网，是历史上大量服务器被入侵的直接原因。
+
+---
+
 ## 🧪 运行测试
 
 ```bash
-# 聊天模块单元测试（31 个用例，mock 离线运行，不需要 Ollama）
+# 全部单元测试（45 个用例，全部 mock 离线运行，不需要 Ollama / MySQL / Redis）
 python -m unittest discover tests -v
 ```
 
+| 文件 | 覆盖内容 |
+|---|---|
+| `tests/test_chatbot.py` | 领域层：Ollama 客户端、聊天逻辑、工具函数（31 个） |
+| `tests/test_api.py` | HTTP 层：路由、参数校验、响应格式、游标分页、404/422、就绪探针 |
+| `tests/test_cache.py` | 缓存层：TTL、主动失效、Redis 不可用时的降级 |
+
 ### CI
 
-`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **31 passed**。
+`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **45 passed**。
 
 CI 里刻意**只装 `requirements.txt`**（不含 torch），并有一条 guard 步骤会在 torch 意外出现时直接失败：
 装了 torch 的话每次 run 要多下 2–3GB，这正是「本地跑通 ≠ CI 跑通」最常见的坑。
