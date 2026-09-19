@@ -1,0 +1,59 @@
+name: Container smoke
+
+# 为什么单独一个工作流，而不是并进主 CI
+# ------------------------------------
+# 主 CI 是「单元测试全绿」这个 badge 的依据，它必须快、稳、无外部依赖。
+# 容器冒烟要拉 mysql/redis 镜像、构建镜像、真起服务、等 MySQL 初始化，
+# 耗时和波动都高一个量级。把两者混在一起，badge 就从「代码是对的」
+# 变成「代码是对的、而且 GitHub 的机器今天不忙」—— 那比没有 badge 更糟：
+# 会让人习惯性地忽略红灯。
+#
+# 本机没有 Docker（无 WSL、内存 1G），所以容器这块一直是「只做过静态校验、
+# 从未真跑过」。GitHub 的 runner 自带 Docker，于是把这件事放到这里做：
+# 每次 push 都真跑一遍整套 docker-compose。
+
+on:
+  push:
+    branches: [master, main]
+  # 支持手动触发：改了 Dockerfile / compose 之后想立刻验证一次，不用等下一次 push。
+  workflow_dispatch:
+
+concurrency:
+  group: container-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compose:
+    name: docker compose up + end-to-end
+    runs-on: ubuntu-latest
+    # 拉三个基础镜像 + 构建 + 起服务 + 等 MySQL 初始化，正常 5-8 分钟。
+    # 给到 25 分钟是为了让「卡住」表现为明确的超时失败，而不是挂在默认上限上。
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install host-side dependencies
+        # 冒烟脚本跑在宿主机上（打发布出来的端口），需要 requests。
+        # 刻意只装 requests 而不是 requirements.txt：这个 job 验证的是容器，
+        # 宿主机只需要「一个能发请求的客户端」，装全量依赖会掩盖
+        # 「镜像里的依赖是不是装全了」——那正是要验的东西之一。
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
+
+      - name: Show docker versions
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Container smoke
+        # 脚本内部会在失败时打印 compose 状态 + api/mysql/假 Ollama 日志，
+        # 所以这里不需要额外的日志收集步骤。
+        run: bash .github/scripts/container_smoke.sh

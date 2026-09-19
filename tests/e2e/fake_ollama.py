@@ -13,6 +13,9 @@
 用法：
     python tests/e2e/fake_ollama.py            # 监听 127.0.0.1:11435
     FAKE_OLLAMA_PORT=11500 python tests/e2e/fake_ollama.py
+
+给容器测试用（容器要能访问到宿主机上的它）：
+    FAKE_OLLAMA_HOST=0.0.0.0 FAKE_OLLAMA_PORT=11434 python tests/e2e/fake_ollama.py
 """
 
 import json
@@ -20,6 +23,13 @@ import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# 监听地址。默认只绑 127.0.0.1（本机联调最安全：同网段的机器扫不到这个端口）。
+#
+# 但容器化测试必须设成 0.0.0.0：容器里的 `host.docker.internal` 解析到的是
+# **宿主机在 docker 网桥上的地址**（如 172.17.0.1），不是回环地址 127.0.0.1。
+# 只绑回环时，宿主机自己 curl 得通、容器却连不上 —— 报错还是 "Connection refused"，
+# 很容易误判成「服务没起」。这是真跑容器才会暴露的一类问题。
+HOST = os.getenv("FAKE_OLLAMA_HOST", "127.0.0.1")
 PORT = int(os.getenv("FAKE_OLLAMA_PORT", "11435"))
 
 # 固定输出：断言可以写死，不怕模型"发挥"。
@@ -85,5 +95,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"fake ollama on http://127.0.0.1:{PORT} (每块间隔 {DELAY}s)")
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    print(f"fake ollama on http://{HOST}:{PORT} (每块间隔 {DELAY}s)")
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

@@ -9,13 +9,21 @@
 |---|---|
 | 镜像与编排文件（`Dockerfile` / `docker-compose.yml`） | ✅ 已写好 |
 | 部署脚本（`deploy.sh`） | ✅ 已写好 |
-| 编排文件之间的自洽性（compose / Dockerfile / `.dockerignore` / `.env` 模板） | ✅ 已用静态校验守住：`tests/test_deploy_manifest.py`（18 用例）+ 证明这些守卫会失败（7 用例），都在 CI 里 |
+| 编排文件之间的自洽性（compose / Dockerfile / `.dockerignore` / `.env` 模板） | ✅ 静态校验守着：`tests/test_deploy_manifest.py`（19 用例）+ 证明这些守卫真会失败（8 用例），都在 CI 里 |
 | 本机跑通整个后端（真 MySQL + 假 Ollama + 真 uvicorn，27 项断言） | ✅ 已验证 |
-| **在真实容器里跑起来** | ❌ **还没验证过** —— 本机没有 WSL、内存 1G，跑不动 Docker |
+| **在真实 Docker 里把整套 compose 跑起来** | ✅ **CI 每次 push 真跑**：`.github/workflows/container-smoke.yml`。本机没 Docker，就用 GitHub runner 自带的 Docker——镜像能构建、容器之间能互通、容器内 MySQL 的表真是 utf8mb4、密码没被拷进镜像、3306/6379 没暴露 |
+| **在云主机上对公网提供服务** | ❌ **还没做过** —— 缺一台能跑 Docker Compose 的 Linux 主机 |
 
-第 3 行是这轮补的。**「文件写好了」和「文件之间自洽」是两件事**：本机没 Docker，
-compose 里写错一个变量名也跑不到，所以改成用静态校验把能查的先查掉——
-凡是「只会在上云第一小时暴露」的问题，尽量挪到提交前。
+倒数第二行是这轮补上的，也是这个项目此前最弱的一点：**「文件写好了」和
+「真跑起来是对的」是两件事**。本机没有 WSL、内存 1G，跑不动 Docker，所以容器的
+真实验证一直缺位。补法有两层：
+
+1. **静态校验**（`tests/test_deploy_manifest.py`，不需要 Docker，秒级）：凡是
+   「只会在上云第一小时暴露」的配置问题，尽量挪到提交前。
+2. **真跑一遍**（`.github/scripts/container_smoke.sh`，在 CI 的 Docker 上跑整套
+   compose）：静态校验只能证明「文件里写了正确的规则」，证明不了「规则真的生效」。
+   比如 `.dockerignore` 里写了 `.env`，但要是文件被检出成 CRLF，规则会静默失效——
+   静态校验照样绿，只有真去镜像里 `ls` 才发现密码躺在那里。
 
 所以这份手册的步骤是「照着做就能上线」，但**第一次上云时如果有报错，属于预期内**，
 按下面「排查」一节逐项对。
@@ -46,13 +54,30 @@ cd ollama-streamlit-chatbot
 
 # ③ 填配置 + 一键部署
 cp .env.prod.example .env
-vi .env                            # 至少填 MYSQL_ROOT_PASSWORD（openssl rand -base64 24）
+vi .env                            # 至少填 MYSQL_ROOT_PASSWORD（openssl rand -hex 24）
 bash deploy.sh
+
+# ④ 验收：把整套容器逐项断言一遍（和 CI 里跑的是同一个脚本）
+bash .github/scripts/container_smoke.sh
 ```
 
 第 ⓪ 步的用处：把「只会在上云第一小时才暴露」的那类问题（`.env` 被拷进镜像、
 `host.docker.internal` 在 Linux 上不解析、`.env` 里改了参数却没透传…）提前拦在本地。
 这些判断都是静态的，不需要 Docker，所以能在本机跑、也在每次 CI 里跑。
+
+第 ④ 步是这轮补的**验收脚本**，它和 CI 里跑的是同一份代码
+（`.github/scripts/container_smoke.sh`），会检查那些「文件看着对、跑起来却不对」的事：
+
+- 镜像里**确实没有** `.env` / `.git` / `tests`（`.dockerignore` 真的生效，而不只是写了规则）
+- 容器**确实以非 root 运行**（`Dockerfile` 里的 `USER appuser` 真的生效）
+- `mysql` / `redis` **确实没有**把端口映射到宿主机，只有 api 暴露
+- 三个依赖探针全为 `true`（`REDIS_URL` 指向服务名、`extra_hosts` 解析通了 Ollama）
+- 流式聊天真的按块到达（每条间隔贴合服务端节奏，没有哪一层在攒批）
+- emoji 经**容器里的 MySQL** 往返无损（证明 `--character-set-server=utf8mb4` 生效了）
+
+> 收尾的规矩：脚本只在「服务是它自己拉起来的」时候才 `docker compose down`
+> **且带 `-v`**。你刚跑完 `deploy.sh` 再跑它，它检测到服务已在运行，就只做断言、
+> 不动你的服务，**不会删数据卷**。CI 里则是从头拉起、跑完清干净。
 
 `deploy.sh` 会依次做：前置检查（docker / compose / .env / 密码强度）→ `git pull`
 → `docker compose up -d --build` → 轮询 `/health/ready` 最多 180 秒 → 打印依赖状态
@@ -166,7 +191,23 @@ server {
 | 在 `.env` 里改了 `TEMPERATURE` / `MAX_TOKENS` 但没生效 | compose 的 `.env` 只做**文件内插值**、不注入容器，api 的 `environment` 里必须显式透传这几个变量 |
 | 想确认镜像里没夹带密码 | `docker run --rm <image> cat /app/.env`（正常情况下应报 No such file）；根因是 `.dockerignore` 漏了 `.env` |
 | 建出来的表字符集不是 utf8mb4 | 检查 mysql 服务是不是用 `command: --character-set-server=utf8mb4` 起的。写成 `MYSQL_CHARSET` 环境变量**无效**（该变量不被 mysql 官方镜像支持，会被静默忽略） |
+| 日志里 `Name or service not known: cd@mysql` 之类的主机名很怪 | 密码里含 `@`。密码是被直接拼进 `DATABASE_URL` 的（`...//root:<密码>@mysql:3306/...`），而 URL 解析器在**第一个** `@` 处切断 userinfo——于是 `ab@cd` 被解析成密码 `ab` + 主机名 `cd@mysql`。实测确认过。改用 `openssl rand -hex 24`；`deploy.sh` 现在会提前拦住含 `@` 的密码 |
 | 想重新来一遍 | `docker compose down -v`（**-v 会删数据卷**，只在你确定不要数据时用） |
+
+## 7.5 上线后跑一次验收
+
+```bash
+bash .github/scripts/container_smoke.sh
+```
+
+和 CI 里跑的是同一份脚本。它会逐项断言「容器化部署真的成立」，包括那些
+静态校验证明不了的：镜像里没有凭据、容器非 root、数据库端口没暴露、
+三个依赖探针全通、流式没有攒批、容器内 MySQL 真的能存 emoji。
+
+检测到服务已在运行时会**只断言、不收尾**，不会删数据卷。
+
+⚠️ 它会在库里留下几条测试数据（一两个会话和消息），线上跑完可以自行清理。
+这是有意的：与其为了「不脏数据」把断言削掉，不如留下几条可辨认的测试记录。
 
 ## 8. 回滚
 

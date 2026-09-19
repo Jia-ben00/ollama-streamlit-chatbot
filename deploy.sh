@@ -32,8 +32,24 @@ docker info >/dev/null 2>&1 || die "Docker 守护进程没跑，或者当前用�
 set +u
 PW="$(grep -E '^MYSQL_ROOT_PASSWORD=' .env | head -1 | cut -d= -f2-)"
 set -u
-[[ -n "$PW" ]] || die ".env 里的 MYSQL_ROOT_PASSWORD 是空的，先填一个强密码：openssl rand -base64 24"
+[[ -n "$PW" ]] || die ".env 里的 MYSQL_ROOT_PASSWORD 是空的，先填一个强密码：openssl rand -hex 24"
 [[ "$PW" != "change-me" && "$PW" != "123456" ]] || die "MYSQL_ROOT_PASSWORD 还是默认值，公网部署必须换掉"
+
+# 密码里不能有 `@`。
+#
+# 原因：compose 把密码直接拼进 api 的 DATABASE_URL：
+#   mysql+pymysql://root:<密码>@mysql:3306/chatbot
+# 而 URL 解析器在**第一个** @ 处切开 userinfo。实测密码 "ab@cd" 会被解析成
+# 密码 "ab" + 主机名 "cd@mysql" —— 容器报的是「找不到主机 cd@mysql」，
+# 几乎不可能一眼看出是密码字符的问题。
+#
+# 推荐 openssl rand -hex 24（字符集 0-9a-f，安全）。
+# `openssl rand -base64 24` 实测也能用（/ + = 都能正确解析），只是 hex 更省心；
+# 若确实要用含 @ 的密码，得写成 %40（URL 百分号编码）。
+if [[ "$PW" == *"@"* ]]; then
+  die "MYSQL_ROOT_PASSWORD 里含 @，会让 DATABASE_URL 解析错主机名（实测：host 会变成 xxx@mysql）。
+       生成一个不含 @ 的密码：openssl rand -hex 24"
+fi
 echo "  docker:   $(docker --version)"
 echo "  compose:  $(docker compose version --short 2>/dev/null || echo '?')"
 echo "  密码长度: ${#PW} 字符（不打印内容）"

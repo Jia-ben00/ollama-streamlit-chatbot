@@ -44,6 +44,8 @@ ollama-streamlit-chatbot/
 ├── requirements-ml.txt             # 情感分析依赖（含 torch / numpy）
 ├── start.bat                       # Windows 一键启动脚本（自动探测解释器）
 ├── .github/workflows/ci.yml        # CI：单测 + 语法检查
+├── .github/workflows/container-smoke.yml  # CI：真起一套 docker compose 跑端到端
+├── .github/scripts/container_smoke.sh     # 容器冒烟/上线验收脚本（CI 与云主机共用）
 ├── .env.example                    # 环境变量示例
 ├── .gitignore
 ├── README.md
@@ -355,6 +357,26 @@ bash deploy.sh                          # 构建 + 起服 + 轮询就绪 + 打�
 | `TEMPERATURE` 等写在 `.env` 里却没在 compose 透传 | 改了参数毫无效果（静默失效） | compose 的 `.env` 只做文件内插值，不注入容器 —— 不看文档想不到 |
 | 用 `MYSQL_CHARSET` 环境变量配字符集 | mysql 官方镜像不支持该变量，被静默忽略 | 不报错，且 MySQL 8 默认恰好也是 utf8mb4 |
 
+**但这些校验全是「读文件比对文本」——它们能证明文件里写了正确的规则，
+证明不了规则真的生效。** 所以还有第二层：`.github/workflows/container-smoke.yml`
+每次 push 都在 GitHub runner 的 Docker 上把整套 compose 真拉起来，跑 26 项断言
+（22 项 HTTP + 4 项容器内）。本机没有 Docker/WSL，这是唯一能真跑容器的地方。
+
+两层刻意分工：
+
+| 层 | 跑什么 | 速度 | 能证明 |
+|---|---|---|---|
+| 静态校验（`tests/test_deploy_manifest*.py`） | 读文件比对 | 毫秒级 | 配置写对了，且守卫真会失败（有元测试反向对照） |
+| 容器冒烟（`container_smoke.sh`） | 真构建 + 真起服务 | 几分钟 | 镜像里没有凭据、容器非 root、容器互通、容器内 MySQL 真是 utf8mb4 |
+
+同理，云主机上部署完也可以直接跑同一个脚本做验收：
+
+```bash
+bash .github/scripts/container_smoke.sh
+```
+
+它检测到服务已在运行时会**只断言、不收尾**，不会删你的数据卷。
+
 ---
 
 ## 🧪 运行测试
@@ -391,6 +413,27 @@ CI 里刻意**只装 `requirements.txt`**（不含 torch），并有一条 guard
 另有一条反向 guard：**确认 `streamlit` 真的装着**。因为界面测试在没有 streamlit 的机器上
 会 `skip` 而不是 `fail` —— 如果哪天依赖被误删，这些用例会安静地全被跳过，
 「CI 是绿的」就成了假象。**跳过不等于通过，所以要专门守一道。**
+
+### 容器冒烟（另一个工作流，刻意不并进主 CI）
+
+`.github/workflows/container-smoke.yml` 每次 push 到 master 时，在 runner 上
+`docker compose up -d --build` 把整套服务真拉起来，再跑 `.github/scripts/container_smoke.sh`。
+
+**为什么不并进主 CI**：主 CI 是那个 badge 的依据，必须快、稳、无外部依赖（现在 < 1 分钟）。
+容器冒烟要拉 mysql / redis 镜像、构建镜像、等 MySQL 初始化，量级完全不同。
+混在一起，badge 的含义就从「代码是对的」变成「代码是对的、而且 GitHub 的机器今天不忙」——
+那比没有 badge 更糟，会让人习惯性忽略红灯。
+
+它补上的正是静态校验够不着的地方：
+
+| 断言 | 属于「文件看着对、跑起来却不对」的哪一类 |
+|---|---|
+| 镜像里 `ls` 不到 `.env` / `.git` / `tests` | `.dockerignore` 规则写了 ≠ 生效（行尾变 CRLF 就会静默失效） |
+| 容器内 `uid != 0` | `Dockerfile` 里的 `USER appuser` 写了 ≠ 生效 |
+| `mysql` / `redis` 没有 `HostPort` | 端口没写 ≠ 没暴露（改错一个键就会映射出去） |
+| `/health` 的 `redis: true` | `REDIS_URL` 指向服务名这件事真的生效了 |
+| `/health` 的 `ollama: true` | `extra_hosts` / `host-gateway` 真的解析通了 |
+| emoji 经容器内 MySQL 往返无损 | `--character-set-server=utf8mb4` 真的生效了 |
 
 ---
 

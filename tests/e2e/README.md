@@ -121,6 +121,49 @@ python tests/e2e/charset_probe.py
 > 这个手法可以推广：**凡是「环境恰好正确」才成立的配置，都该造一个敌对环境验一次。**
 > 否则你验的是环境的运气，不是代码。
 
+## 容器冒烟：验证「真的在 Docker 里跑起来」
+
+```bash
+# 本机有 Docker 时（CI 里也是这个脚本）
+bash .github/scripts/container_smoke.sh
+
+# 只想跑断言部分（需要已有一套在跑的服务）
+API_BASE=http://127.0.0.1:8000 python tests/e2e/container_smoke.py
+```
+
+前面几个脚本验的是「裸进程拼起来对不对」（uvicorn 直起）；这一个验的是
+**整套装起来对不对**：镜像能不能构建、容器之间名字解析通不通、容器里的 MySQL
+表字符集对不对、凭据有没有被拷进镜像。
+
+编排在 `.github/scripts/container_smoke.sh`，断言在 `container_smoke.py`。
+分工的原因是断言只能看 HTTP 层，而「镜像里有没有 `.env`」「容器是不是 root」
+「端口有没有映射到宿主机」必须用 `docker CLI` 才看得到。
+
+它的 26 项断言（22 项 HTTP + 4 项容器内）刻意都对着**静态校验够不着**的地方：
+
+| 断言 | 为什么静态校验不够 |
+|---|---|
+| 镜像里 `ls` 不到 `.env` / `.git` / `tests` | `.dockerignore` 里写了规则 ≠ 规则生效（CRLF 会让它静默失效） |
+| 容器内 uid ≠ 0 | `Dockerfile` 写了 `USER appuser` ≠ 生效 |
+| mysql / redis 无 `HostPort`、api 有 | 配置写对 ≠ 运行时真的没暴露 |
+| `/health` 的 `redis: true` | `REDIS_URL` 用服务名这件事真的生效了 |
+| `/health` 的 `ollama: true` | `extra_hosts: host-gateway` 真的解析通了 |
+| emoji 经容器内 MySQL 往返无损 | `--character-set-server=utf8mb4` 真的生效了 |
+| 每块间隔贴合服务端节奏 | 中间任何一层攒批都会让间隔变成 N 倍 |
+
+两个实测踩到的坑，都写进脚本注释了：
+
+1. **假 Ollama 必须绑 `0.0.0.0`**。容器里的 `host.docker.internal` 解析到的是宿主机在
+   docker 网桥上的地址（如 172.17.0.1），不是回环地址。只绑 `127.0.0.1` 时宿主机自己
+   curl 得通、容器连不上，报错还是 `Connection refused`，很容易误判成「服务没起」。
+2. **别用 `X="$(cmd | tail -1)"` 做检查**。`$()` 的退出码来自管道最后那个 `tail`，
+   `cmd` 失败时 `X` 是空的，于是「拿不到结果」被当成「结果正常」，检查静默失效。
+   脚本里改成让被测命令输出一个固定标记（如 `LEAKCHECK=CLEAN`），拿不到标记就报错——
+   **所有检查都 fail-closed**。
+
+> 收尾的规矩：只在「服务是本次运行自己拉起来的」时候才 `docker compose down -v`。
+> 在云主机上刚 `deploy.sh` 完再跑它，它检测到服务已在运行，就只做断言、**不会删数据卷**。
+
 ## 一个小提醒
 
 `setup_db.py` 会 **DROP 再 CREATE** 临时库（默认 `chatbot_api_e2e`）。别把它指向你的
