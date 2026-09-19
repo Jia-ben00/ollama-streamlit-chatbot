@@ -202,6 +202,12 @@ python tests/e2e/public_check.py --url http://your-domain.com
 上游换成 `tests/e2e/plain_sse.py`）——只有正例的话，「通过」什么都证明不了：
 一把恒真的尺子也长这样。完整对照表见 `tests/e2e/README.md`。
 
+> ⚠️ 反例要改的是**两个**变量：`proxy_buffering` **和上游**。只改前者、让上游还是
+> 那个 chunked 的真应用，反例就永远红不了（chunked 本来就不攒批），
+> 而失败形态是看不懂的 `ConnectionResetError`。
+> 这一点是**在 CI 上真跑第一次才发现的** —— 开发机没有 Docker，
+> 所以这个脚本上云之前从没被执行过。**「本机验不了」不等于「可以先不验」。**
+
 > 一个反直觉的实测结论，值得知道：**nginx 对 chunked 分帧的响应本来就不攒批**，
 > 而我们的应用（uvicorn）正是 chunked。所以在当前形态下，配置里那句
 > `proxy_buffering off` 和响应头 `X-Accel-Buffering: no` 在客户端**观测不到差别**。

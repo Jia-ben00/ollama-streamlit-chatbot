@@ -26,10 +26,21 @@
 而真应用（uvicorn）正是 chunked —— 拿它当反例，开着缓冲也照样是增量的，反例红不了。
 `plain_sse.py` 用最朴素的分帧（靠关连接表示结束），那才是这个经典的失败形态。
 
-⚠️ 踩过的坑：第一版反例想用 `proxy_hide_header X-Accel-Buffering` 去「摘掉」应用的防缓冲头。
-那个指令只影响**发给客户端**的响应头，而 nginx 是在上游模块里读到这个头当场就关掉缓冲的 ——
-看着把变量摘掉了，其实一点没摘。于是几个变体全是 INCREMENTAL，像是「配置怎么写都行」。
-**受控变量必须真的被控制住**，否则实验结论是假的。
+⚠️ 踩过的坑（两个，都是「看着在测、其实没测」）：
+1. 第一版反例想用 `proxy_hide_header X-Accel-Buffering` 去「摘掉」应用的防缓冲头。
+   那个指令只影响**发给客户端**的响应头，而 nginx 是在上游模块里读到这个头当场就关掉缓冲的 ——
+   看着把变量摘掉了，其实一点没摘。于是几个变体全是 INCREMENTAL，像是「配置怎么写都行」。
+   **受控变量必须真的被控制住**，否则实验结论是假的。
+2. 反例要改的是**两个**变量：`proxy_buffering` 和**上游**。第一版只改了前者、
+   直接复用 A 的渲染结果（上游还是 `api:8000`），于是 B 打到的仍是真应用 ——
+   而真应用是 chunked 分帧，nginx 对它本来就不攒批，反例永远红不了。
+   失败形态还不是一条好懂的「判定=INCREMENTAL」，而是 `ConnectionResetError`
+   （`POST /` 打真应用收到 405 后连接被直接切断）。
+   现在有一条显式断言钉住「反例的上游必须是 stub」。
+
+⚠️ 这台机器上**没有 Docker**，所以本脚本在上云之前**从未真正执行过**——
+CI 上的第一次运行就是它的第一次运行，而它红了（上面第 2 条）。
+「本机验不了」不等于「可以先不验」：真正能兜住它的只有 CI 上的真跑。
 
 退出码：0 通过；1 有断言不成立；2 环境不满足（没有 Docker / compose 没在跑）。
 """
@@ -247,10 +258,35 @@ def main():
               "所以公网侧只能靠到达时刻判断")
 
         # ── B：反例 —— 开着 proxy_buffering，上游靠关连接结束 ─────────────
-        buf_conf = ours.replace("    proxy_buffering off;", "    proxy_buffering on;")
-        check("反例配置确实改动了（否则反例不是反例）", buf_conf != ours,
+        #
+        # ⚠️ 反例要改的是**两个**变量：缓冲开关，和上游。只改前者会得到一个
+        # 「看着像反例、其实不是」的东西 —— 第一版就是这么写的：直接复用 A 的渲染结果
+        # （上游 `api:8000`），于是 B 打到的还是真应用。真应用是 chunked 分帧，
+        # 而 nginx 对 chunked 本来就不攒批 —— 反例永远红不了，且失败形态是
+        # `ConnectionResetError`（POST / 打真应用收到 405 后连接被直接切断），
+        # 而不是一条「判定=INCREMENTAL」的好看报错。CI 上真跑第一次才暴露。
+        #
+        # stub 跑在宿主机上，容器里只能走 host.docker.internal（下面 docker run
+        # 带了 host-gateway），所以上游地址得跟着换成它。
+        stub_upstream = f"host.docker.internal:{stub_port}"
+        conf_b_text = render(TEMPLATE.read_text(encoding="utf-8"),
+                             {"SERVER_NAME": "_", "API_UPSTREAM": stub_upstream,
+                              "LISTEN_PORT": str(port_b)})
+        buf_conf = conf_b_text.replace("    proxy_buffering off;", "    proxy_buffering on;")
+        check("反例配置确实改动了（否则反例不是反例）", buf_conf != conf_b_text,
               "模板里找不到 `    proxy_buffering off;`，锚点失效")
-        if buf_conf == ours:
+        if buf_conf == conf_b_text:
+            return 1
+        # 这一条就是上面那个坑的守卫：反例的上游必须是 close-delimited 的 stub，
+        # 打到 chunked 的真应用上它红不了，反例也就失去了意义。
+        upstream_ok = f"proxy_pass http://{stub_upstream};" in buf_conf
+        check("反例的上游指向裸 SSE stub（不是真应用）", upstream_ok,
+              f"反例必须打到 close-delimited 的 stub（{stub_upstream}）；"
+              "打到真应用（chunked）上它永远不会被判成攒批")
+        if not upstream_ok:
+            # 前提已经破了，继续跑只会得到一个看不懂的报错，不如在这里停住。
+            print()
+            print(f"{len(failures)} 项失败：" + "; ".join(failures))
             return 1
         conf_b = workdir / "default.conf"
         conf_b.write_bytes(buf_conf.encode("utf-8"))

@@ -284,13 +284,26 @@ python tests/e2e/nginx_check.py --keep     # 失败时保留容器，便于进�
 看着把变量摘掉了，其实一点没摘，几个变体全是 INCREMENTAL，像是「配置怎么写都行」。
 **受控变量必须真的被控制住**，否则实验结论是假的（真正能无视它的是 `proxy_ignore_headers`）。
 
+⚠️ 第二个坑，**是 CI 上真跑第一次才抓到的**：反例要改的是**两个**变量 ——
+`proxy_buffering` **和上游**。第一版只改了前者，直接复用 A 的渲染结果（上游还是 `api:8000`），
+于是 B 打到的仍是真应用；而真应用是 chunked 分帧，nginx 对它本来就不攒批 ——
+**反例永远红不了**。更麻烦的是它的失败形态不是一条好懂的「判定 = INCREMENTAL」，
+而是 `ConnectionResetError`（`POST /` 打到真应用收到 405 后连接被直接切断），
+看日志要绕一圈才知道是上游打错了。现在有一条显式断言钉住「反例的上游必须是 stub」。
+
+> ⚠️ 值得单独记一笔：这台开发机**没有 Docker**，所以 `nginx_check.py` 在上云之前
+> **从来没有真正执行过** —— CI 上的第一次运行就是它的第一次运行，而它红了。
+> **「本机验不了」不等于「可以先不验」**：静态守卫能证明「文件里写了正确的规则」，
+> 但证明不了「这个脚本自己跑得起来」，后者只有真跑能兜住。
+
 ## 反向对照：证明「守卫真的会红」
 
 ```bash
-python tests/e2e/reverse_check.py                  # 四个分组都跑
+python tests/e2e/reverse_check.py                  # 五个分组都跑
 python tests/e2e/reverse_check.py schema           # 只跑一组
 python tests/e2e/reverse_check.py container_smoke  # 只跑一组
 python tests/e2e/reverse_check.py stream_probe     # 只跑一组
+python tests/e2e/reverse_check.py nginx            # 只跑一组
 ```
 
 **「测试全绿」不能证明测试有效** —— 断言写松了、写成恒真条件，一样全绿。
@@ -302,10 +315,13 @@ python tests/e2e/reverse_check.py stream_probe     # 只跑一组
 | `schema` | 缺列 / 类型 / 枚举取值 / 可空性 / 索引 / 字符集声明 / 符号台账 / 快照少一张表 | 8/8 全红 |
 | `container_smoke` | 端口断言不等就绪 / 丢空状态健全性检查 / 端口缺失不再失败 | 3/3 全红 |
 | `stream_probe` | 尺子不判跨度 / 块数不足当通过 / 尺子不判首块位置 / 阈值参数不接线 | 4/4 全红 |
+| `nginx` | 不关缓冲 / 退化成 HTTP1.0 / Connection 没置空 / 超时退回 60s / 上游写死 127.0.0.1 / 占位符小写 / 模板没挂进容器 / 模板不钉 LF | 8/8 全红 |
 
-**后两组守的不是业务代码，而是判据本身** —— 一个量不出东西的尺子，
+**后三组守的不是业务代码，而是判据本身** —— 一个量不出东西的尺子，
 和一个量出「一切正常」的尺子长得一模一样。`stream_probe` 那把尤其值得守：
 它错的时候部署是**能用的**，只是从「一个个蹦字」变成「转圈等到最后出全文」。
+`nginx` 那一组的性质特殊：它守的三类文件（模板 / compose / `.gitattributes`）
+**错了本机毫无症状**（本机没装 nginx），要等 CI 第 9 步在真容器上量到达时刻才暴露。
 
 > 这一组第一次跑就抓到了自己的问题：**「尺子不判跨度」那条变异没变红**——
 > 现实样本里「一起到达」几乎总伴随「首块来得太晚」，于是另一条判据先命中了，
