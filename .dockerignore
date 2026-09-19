@@ -1,0 +1,56 @@
+# 构建上下文排除清单。
+#
+# 少了这个文件，`COPY . .` 会把「当前目录下的一切」都拷进镜像，其中三样特别要命：
+#
+# 1. `.env` —— deploy.sh 要求先 `cp .env.prod.example .env` 再 build，
+#    所以构建时这个文件**一定存在**，里面是 MySQL root 密码。
+#    没有 .dockerignore 的话它会静静地躺进镜像层里（`docker history`/导入镜像即可读出）。
+#    这是本项目最容易被忽略的一条安全缺陷：本机开发时 .env 被 .gitignore 挡住了，
+#    不容易想到它其实会进镜像。
+# 2. `.git/` —— 整个版本历史，白白撑大镜像，还可能带上历史提交里的凭据。
+# 3. `__pycache__/` + `.venv/` —— 前者与本机 Python 版本绑定，进容器反而可能出错；
+#    后者动辄几百 MB，把构建上下文撑大、拖慢每一次 build。
+#
+# 面试可以这么讲：.dockerignore 不只是"省空间"，它同时是一条**凭据边界**——
+# 决定「哪些文件允许进入产物」。镜像一旦被推送/共享，里面的东西就收不回来了。
+
+# ── 凭据与版本控制 ─────────────────────────────────────
+.env
+.env.*
+!.env.prod.example
+.git
+.gitignore
+.gitattributes
+.github
+
+# ── Python 产物与虚拟环境 ──────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# ── 不进容器的代码 ─────────────────────────────────────
+# Streamlit 界面跑在用户本机，不在容器里；情感分析需要 torch，刻意不进 API 镜像。
+app.py
+sentiment_analysis/
+tests/
+requirements-ml.txt
+
+# ── 文档与本地资源 ─────────────────────────────────────
+docs/
+assets/
+*.md
+.streamlit/
+
+# ── 编辑器 / 系统杂项 ──────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

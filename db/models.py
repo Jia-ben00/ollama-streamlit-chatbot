@@ -48,6 +48,29 @@ from sqlalchemy.orm import declarative_base, relationship
 Base = declarative_base()
 
 
+def _table_args() -> dict:
+    """每张表都要带的方言参数：显式声明字符集与排序规则。
+
+    为什么必须写死在模型里，而不是交给「数据库默认值」：
+    不声明时，`CREATE TABLE` 的表字符集**继承数据库的默认值**。本机练习库恰好是
+    utf8mb4_0900_ai_ci，所以一直没出问题；但同一份代码换到默认字符集是 latin1 的
+    实例上（老 my.cnf、老镜像），建出来的表就是 latin1，INSERT emoji 会直接报
+    `Incorrect string value: '\\xF0\\x9F...'`。
+    也就是说：不写的话，「能不能存 4 字节字符」这件事被寄托在服务器配置上；
+    写进模型之后，它才变成代码的一部分。
+
+    MySQL 的 `utf8` 只有 3 字节，存不下 emoji —— 这就是为什么这里必须是 `utf8mb4`，
+    也是面试第 6 问的答案。
+
+    用函数返回新 dict，而不是定义一个模块级常量被 6 张表共用：
+    避免多张表引用同一个可变对象（SQLAlchemy 处理 __table_args__ 时会读取这个 dict）。
+    """
+    return {
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_0900_ai_ci",
+    }
+
+
 class User(Base):
     """用户表，对应 chatbot.users。
 
@@ -57,6 +80,7 @@ class User(Base):
     """
 
     __tablename__ = "users"
+    __table_args__ = _table_args()
 
     id = Column(INTEGER(unsigned=True), primary_key=True, autoincrement=True)
     username = Column(String(50), nullable=False, unique=True)
@@ -78,6 +102,7 @@ class Model(Base):
     """
 
     __tablename__ = "models"
+    __table_args__ = _table_args()
 
     id = Column(INTEGER(unsigned=True), primary_key=True, autoincrement=True)
     name = Column(String(60), nullable=False, unique=True)
@@ -101,6 +126,7 @@ class Conversation(Base):
     """
 
     __tablename__ = "conversations"
+    __table_args__ = _table_args()
 
     id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
     user_id = Column(
@@ -139,6 +165,7 @@ class Message(Base):
     """
 
     __tablename__ = "messages"
+    __table_args__ = _table_args()
 
     id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
     conversation_id = Column(
@@ -163,6 +190,7 @@ class Tag(Base):
     """标签表，对应 chatbot.tags。name 唯一（uk_tags_name）。"""
 
     __tablename__ = "tags"
+    __table_args__ = _table_args()
 
     id = Column(INTEGER(unsigned=True), primary_key=True, autoincrement=True)
     name = Column(String(30), nullable=False, unique=True)
@@ -179,6 +207,7 @@ class ConversationTag(Base):
     """
 
     __tablename__ = "conversation_tags"
+    __table_args__ = _table_args()
 
     conversation_id = Column(
         BIGINT(unsigned=True),

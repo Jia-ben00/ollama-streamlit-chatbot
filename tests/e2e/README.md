@@ -92,7 +92,39 @@ C. 会话列表 EXPLAIN：两张表都是 Using index（覆盖索引，无回表
 这些数字被引用在 `docs/interview-notes.md` 里 —— 面试时说「我测过，数字是这些」比
 「我做了优化」有用得多。
 
+## 字符集：证明「那行声明真的有用」
+
+```bash
+python tests/e2e/charset_probe.py
+```
+
+`db/models.py` 里给每张表都写了 `mysql_charset=utf8mb4`。但「写了这行代码」和
+「这行代码有用」，是两件容易被混为一谈的事：本机练习库本来就是 utf8mb4，
+**不加也能跑通**，很容易得出「加不加都一样」的错误结论。
+
+所以这里做一次**受控对照**——故意建一个默认字符集是 `latin1` 的库（敌对环境）：
+
+```
+[A] 对照组：裸 DDL 建表，不指定字符集（改动前的行为）
+    [OK] 表字符集继承库默认值（即 latin1）        <- collation=latin1_swedish_ci
+    [OK] latin1 表写入 emoji 失败                 <- DataError: (1366, "Incorrect string value: ...")
+[B] 实验组：仓库 ORM 建表，每张表显式声明 utf8mb4（现在的代码）
+    [OK] 建出 6 张表
+    [OK] 6 张表 collation 全为 utf8mb4_0900_ai_ci（不受库默认值影响）
+[C] 走 ORM 写入并读回 emoji（端到端往返）
+    [OK] emoji 经 ORM -> MySQL -> ORM 无损
+```
+
+同一个库、同一份数据，只改「建表时有没有声明字符集」，结果一个是写入报错、
+一个是无损往返 —— 这才说明那行声明是**有效的**，而不是「数据库恰好是对的」。
+
+> 这个手法可以推广：**凡是「环境恰好正确」才成立的配置，都该造一个敌对环境验一次。**
+> 否则你验的是环境的运气，不是代码。
+
 ## 一个小提醒
 
 `setup_db.py` 会 **DROP 再 CREATE** 临时库（默认 `chatbot_api_e2e`）。别把它指向你的
 练习库：`E2E_DB` 换名字即可，但千万别设成 `chatbot`。
+
+`charset_probe.py` 同理，它会重建 `chatbot_charset_probe` 这个库（跑完自动 drop），
+库名可用 `E2E_CHARSET_DB` 改。

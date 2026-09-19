@@ -71,6 +71,7 @@ ollama-streamlit-chatbot/
 ├── cache.py                        # Redis 会话上下文缓存（连不上自动降级）
 ├── Dockerfile                      # 多阶段构建
 ├── docker-compose.yml              # api + mysql + redis（healthcheck + depends_on）
+├── .dockerignore                   # 构建上下文排除（.env 不进镜像 —— 这是一条凭据边界）
 ├── deploy.sh                       # 云主机一键部署脚本
 ├── .env.prod.example               # 生产环境变量模板
 ├── .gitattributes                  # 换行符策略（sh 用 LF / bat 用 CRLF）
@@ -101,6 +102,8 @@ ollama-streamlit-chatbot/
 │   ├── test_chat_session.py        # 会话抽象层测试（两种数据源的语义）
 │   ├── test_app.py                 # 界面测试（Streamlit AppTest 无头跑 app.py）
 │   ├── test_cache.py               # 缓存层测试（假 Redis，含降级行为）
+│   ├── test_deploy_manifest.py     # 部署清单自洽性校验（compose / Dockerfile / .env）
+│   ├── test_deploy_manifest_guards.py  # 元测试：证明上面那些守卫真的会失败
 │   └── e2e/                        # 端到端（需外部服务，不进 CI，详见其 README）
 └── assets/
 ```
@@ -340,12 +343,24 @@ bash deploy.sh                          # 构建 + 起服 + 轮询就绪 + 打�
 > 只暴露 API 端口：`docker-compose.yml` 故意不把 3306 / 6379 映射到宿主机 ——
 > 把无密码的 Redis 或数据库端口放到公网，是历史上大量服务器被入侵的直接原因。
 
+**上云之前跑一遍清单校验**（就是 `python -m unittest tests.test_deploy_manifest`，
+每次 CI 也会跑）。这类问题在本机是看不见的：本机没装 Docker，compose 写错了跑不到；
+就算装了 Docker Desktop（Mac/Windows），`host.docker.internal` 默认能解析，而云主机是 Linux。
+实测拦下来的几类：
+
+| 缺陷 | 后果 | 本机为什么发现不了 |
+|---|---|---|
+| 缺 `.dockerignore`，`COPY . .` 把 `.env` 一起拷进去 | 数据库密码被烤进镜像层，`docker history` 就能读出来 | `.env` 被 `.gitignore` 挡住了，容易以为它不会进镜像 |
+| 用了 `host.docker.internal` 但没配 `extra_hosts` | Linux 上直接 `Name or service not known`，聊天功能全废 | Mac/Windows 的 Docker Desktop 自带这个别名 |
+| `TEMPERATURE` 等写在 `.env` 里却没在 compose 透传 | 改了参数毫无效果（静默失效） | compose 的 `.env` 只做文件内插值，不注入容器 —— 不看文档想不到 |
+| 用 `MYSQL_CHARSET` 环境变量配字符集 | mysql 官方镜像不支持该变量，被静默忽略 | 不报错，且 MySQL 8 默认恰好也是 utf8mb4 |
+
 ---
 
 ## 🧪 运行测试
 
 ```bash
-# 全部测试（116 个用例，无需 Ollama / MySQL / Redis；界面测试用无头方式跑）
+# 全部测试（143 个用例，无需 Ollama / MySQL / Redis；界面测试用无头方式跑）
 python -m unittest discover tests -v
 ```
 
@@ -357,6 +372,8 @@ python -m unittest discover tests -v
 | `tests/test_chat_session.py` | 会话抽象层：两种数据源的语义差异、失败降级 |
 | `tests/test_app.py` | 界面层：用 Streamlit `AppTest` 无头执行 `app.py`，验证首屏与数据源切换 |
 | `tests/test_cache.py` | 缓存层：TTL、主动失效、Redis 不可用时的降级 |
+| `tests/test_deploy_manifest.py` | 部署清单自洽性：从源码反推容器必须拿到的环境变量、.dockerignore 覆盖密钥、healthcheck 与 depends_on 对齐 |
+| `tests/test_deploy_manifest_guards.py` | 元测试：把每个要防的缺陷种回去，确认上面那些守卫真的会报错 |
 
 > `tests/test_app.py` 是这一轮新增的能力：Streamlit 应用以前被认为「没法测」，
 > 现在用官方 `AppTest` 可以在无浏览器的情况下执行整个页面。它上线当天就抓到一个真问题——
@@ -366,7 +383,7 @@ python -m unittest discover tests -v
 
 ### CI
 
-`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **116 passed**。
+`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **143 passed**。
 
 CI 里刻意**只装 `requirements.txt`**（不含 torch），并有一条 guard 步骤会在 torch 意外出现时直接失败：
 装了 torch 的话每次 run 要多下 2–3GB，这正是「本地跑通 ≠ CI 跑通」最常见的坑。

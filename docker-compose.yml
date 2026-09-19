@@ -18,9 +18,16 @@ services:
       # 密码用环境变量注入（.env 提供），不把真实凭据写死进 compose 文件。
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-me}
       MYSQL_DATABASE: chatbot
-      # 显式指定 utf8mb4 字符集，和练习库 / ORM 对齐，避免容器默认 latin1 存不了中文。
-      MYSQL_CHARSET: utf8mb4
-      MYSQL_COLLATION: utf8mb4_0900_ai_ci
+    # 显式指定服务端默认字符集与排序规则，和练习库 / ORM 对齐
+    # （utf8mb4 才能存 4 字节字符，也就是 emoji —— utf8 在 MySQL 里只到 3 字节）。
+    #
+    # ⚠️ 不要用 environment 里的 MYSQL_CHARSET / MYSQL_COLLATION：那不是 mysql 官方镜像
+    # 支持的变量，写了不报错、只是被静默忽略，属于「看起来配了其实没配」。
+    # 官方文档给的机制是：命令行末尾的 mysqld 参数会被原样透传。
+    # command 只覆盖镜像的 CMD，entrypoint（docker-entrypoint.sh）照常执行。
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
     # 故意不把 3306 映射到宿主机（公网上就是「给全世界开了一个数据库端口」）。
     # 容器之间走 compose 内网服务名互访，根本不需要宿主机端口。
     # 需要在服务器上手工连库调试时用：
@@ -41,6 +48,14 @@ services:
     # 同样不映射端口：Redis 默认无密码，暴露到公网等于把数据交出去
     # （历史上大量 Redis 被写 SSH key / 挖矿就是这么来的）。
     # 调试用：docker compose exec redis redis-cli
+    healthcheck:
+      # Redis 起得很快，但"容器已启动"和"能接受命令"仍是两件事。
+      # 给它一个健康检查，api 才能用 service_healthy 等它真就绪。
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   api:
     build: .
@@ -54,6 +69,20 @@ services:
       REDIS_URL: "redis://redis:6379/0"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
       OLLAMA_MODEL: "${OLLAMA_MODEL:-llama3.2}"
+      OLLAMA_TIMEOUT: "${OLLAMA_TIMEOUT:-120}"
+      # 生成参数的透传。src/config.py 会读这三个变量，但 compose 的 .env 只用于
+      # 「compose 文件内部的变量插值」，**不会自动注入容器环境**。少了这三行，
+      # 在 .env 里调 TEMPERATURE 完全没效果 —— 又一处静默失效的配置。
+      TEMPERATURE: "${TEMPERATURE:-0.7}"
+      TOP_P: "${TOP_P:-0.9}"
+      MAX_TOKENS: "${MAX_TOKENS:-2048}"
+    # Linux 上 host.docker.internal 不会自动解析 —— Docker Desktop for Mac/Windows
+    # 才自带这个别名，Linux 原生 Docker 是"显式 opt-in"的设计差异，不是配置写错。
+    # 缺了这段，容器里求 OLLAMA_BASE_URL 会直接
+    # `Name or service not known`，聊天功能整体不可用。
+    # host-gateway 是 Docker 20.10+ 的特殊值，运行时替换为宿主机网关 IP。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       # 只暴露 API。端口可用 .env 里的 API_PORT 覆盖（默认 8000）。
       - "${API_PORT:-8000}:8000"
@@ -61,7 +90,7 @@ services:
       mysql:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     # api 启动后自动执行建表脚本，再起服务。
     command: >
       sh -c "python -m db.init_db && uvicorn api.main:app --host 0.0.0.0 --port 8000"

@@ -15,3 +15,7 @@ redis>=5.0.0
 # 没有它 CI 里 test_api.py 的 from fastapi.testclient import TestClient 会
 # 直接 ImportError（本地旧版 fastapi 用 httpx 所以没暴露，CI 装最新版才暴露）。
 httpx2>=0.1.0
+
+# 部署清单校验（tests/test_deploy_manifest.py 要解析 docker-compose.yml）。
+# 它本来就是 uvicorn[standard] 的传递依赖，这里显式声明是为了不依赖巧合。
+pyyaml>=6.0

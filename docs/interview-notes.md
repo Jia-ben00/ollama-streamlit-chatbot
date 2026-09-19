@@ -13,10 +13,11 @@
 
 | 验证项 | 结果 |
 |---|---|
-| 单元测试 | `Ran 116 tests ... OK`（领域 31 + HTTP 层 19 + 前端客户端 25 + 会话抽象 33 + 界面 4 + 缓存 4） |
+| 单元测试 | `Ran 143 tests ... OK`（领域 31 + HTTP 层 19 + 前端客户端 25 + 会话抽象 33 + 界面 4 + 缓存 4 + 部署清单 19 + 守卫元测试 8） |
 | 端到端冒烟（服务端视角） | `tests/e2e/smoke.py` 27 项断言全过 |
 | 端到端冒烟（前端视角） | `tests/e2e/frontend_smoke.py` 30 项断言全过 |
 | 建表 | 用仓库里的 `python -m db.init_db` 在空库建出 **6 张表**，collation 全 `utf8mb4_0900_ai_ci` |
+| 表字符集是「代码声明」在起作用（受控实验） | 故意建默认字符集为 **latin1** 的库：裸 DDL 建表 → 写 emoji 报 `1366 Incorrect string value`；走 ORM 建表 → 6 张表全 utf8mb4，emoji 往返无损 |
 | SSE 流式（服务端到客户端） | 9 个 chunk，块间隔均匀 **47ms**（服务端设定 50ms），`Content-Type: text/event-stream` |
 | SSE 流式（前端客户端读到的） | 9 个 chunk，块间隔 **[50, 51, 51, 51, 50, 51, 51, 50] ms** —— 前端侧没有二次缓冲 |
 | emoji 往返 | `表情测试 🚀😀🔥` 经 HTTP → MySQL → HTTP 无损，`@@character_set_connection = utf8mb4` |
@@ -182,15 +183,27 @@ chunk_size=   1 | 首块 0.000s | 总 0.453s | 间隔 [0.063, 0.046, 0.047, 0.04
 
 ---
 
-## 附：三个「本地跑通 ≠ 生产跑通」的实例
+## 附：七个「本地跑通 ≠ 生产跑通」的实例
 
-这三条比任何理论都好用，因为都是这轮改造里**真实踩到的**：
+这七条比任何理论都好用，因为都是这轮改造里**真实踩到的**。前三条在代码/数据库层，
+后四条在**部署清单**层——它们的共同点是「本机根本跑不到那段代码」：
 
 | # | 现象 | 根因 | 为什么本地没暴露 |
 |---|---|---|---|
 | 1 | `Column(Integer, unsigned=True)` 直接抛 `TypeError: Additional arguments should be named <dialectname>_<argument>` | `unsigned` 是 MySQL **方言**参数，不是 SQLAlchemy 通用参数 | 通用类型 vs 方言类型的区别，写的时候不报，只有真建表/编译 DDL 才炸 |
 | 2 | CI 里 `test_api` 全挂：`The starlette.testclient module requires the httpx2 package` | 最新版 starlette 的 `TestClient` 换了依赖（`httpx` → `httpx2`） | 本机装的是旧版 fastapi/httpx，能跑；CI 装的是最新版 |
 | 3 | `messages.created_at` 上明明有索引，范围查询却 `type=ALL` + `Using filesort` | 3857 行里几乎所有行都满足 `created_at >= '2026-01-01'`，索引选择性≈0，优化器判定「全表 + 内存排序」比「走索引再回表」更便宜 | 这是**数据分布**决定的，不是 SQL 写错。数据量/时间跨度一变，同一个索引就会重新生效 |
+| 4 | `.dockerignore` 缺了，`COPY . .` 把 `.env`（含 MySQL root 密码）一起拷进镜像 | 构建上下文默认包含 `.env`，Docker 只排除 `.dockerignore` 里写的东西。而 `deploy.sh` 要求 build **之前**先 `cp .env.prod.example .env`，所以它一定存在 | 直觉是「`.env` 不进 git 就不会进镜像」——但 `.gitignore` 和 `.dockerignore` 是**两套互不相干的排除规则** |
+| 5 | 容器里报 `could not resolve host: host.docker.internal` | Linux 原生 Docker 不提供这个别名（那是 Docker Desktop for Mac/Windows 的行为），要显式写 `extra_hosts: host.docker.internal:host-gateway`（Docker 20.10+） | 本机是 Windows：若用 Docker Desktop 试，**这条永远复现不出来**，只有 Linux 云主机上才炸 |
+| 6 | 在 `.env` 里改了 `TEMPERATURE`，容器读到的还是默认值 | compose 的 `.env` 只用于**文件内变量插值**，不会注入容器环境；变量必须在 service 的 `environment` 里显式透传 | 本地直连模式读的是同一个 `.env`、改了就生效 —— 两套加载机制长得很像，行为不同 |
+| 7 | 用 `MYSQL_CHARSET` 环境变量配字符集，实际没生效 | mysql **官方**镜像不支持该变量（那是 mariadb 镜像的）；官方机制是把 mysqld 参数放在命令行末尾透传 | 不报错，且 MySQL 8 默认字符集恰好就是 utf8mb4 —— 结果「碰巧正确」，把无效配置掩盖了 |
+
+第 4 条最值得讲：**它是一条安全边界，不是省空间技巧。** 镜像一旦构建出来，
+里面的东西就收不回来了（`docker history`、导出镜像层都能读出）。把 `.dockerignore`
+当成「排除清单」，本质是在回答「哪些文件允许进入产物」。
+
+第 5–7 条的共同结构是：**同一个配置项，在两个平台上语义不同，或者看起来生效了其实没有。**
+这类问题没有单元测试能覆盖，只能用「静态校验清单」把它们挡住（见下一节）。
 
 第 3 条的完整复核（迁移到 104 行的临时库上同样复现）：
 
@@ -202,6 +215,38 @@ chunk_size=   1 | 首块 0.000s | 总 0.453s | 间隔 [0.063, 0.046, 0.047, 0.04
 ```
 
 同一个库，一条查询索引完美生效，另一条完全不生效——**说明"建了索引"和"用上索引"是两件事**。
+
+---
+
+## 附 2：怎么防止「测试变成装饰」——给守卫做反向对照
+
+上面那些部署清单问题，我用 `tests/test_deploy_manifest.py` 静态守住（18 条断言，进 CI）。
+但这里有个更隐蔽的风险：**断言写松了、或者写成恒真条件，它照样全绿，问题照旧上线。**
+
+所以再加一层元测试 `tests/test_deploy_manifest_guards.py`：把每个要防的缺陷**种回去**，
+确认对应用例真的会失败。做法不需要 Docker —— 那个模块是纯文件解析、路径来自模块级常量，
+把常量指到「被改坏的副本」上就能验证。
+
+实测 8/8 全部生效：
+
+| 种回的缺陷 | 应该报错的守卫 |
+|---|---|
+| api 少透传 `REDIS_URL` | `test_api_receives_every_env_var_the_code_reads` ✅ |
+| 删掉 `extra_hosts` | `test_host_docker_internal_requires_extra_hosts` ✅ |
+| 透传一个没人读的变量 | `test_api_env_has_no_dead_entries` ✅ |
+| 字符集写成 `MYSQL_CHARSET` | `test_mysql_charset_is_set_via_mysqld_command` ✅ |
+| 把 3306 映射到宿主机 | `test_only_api_publishes_ports` ✅ |
+| `.dockerignore` 不再排除 `.env` | `test_credentials_and_vcs_are_excluded` ✅ |
+| 排除掉 Dockerfile 要 COPY 的文件 | `test_copy_sources_are_not_dockerignored` ✅ |
+| 去掉 `.gitattributes` 的 `eol=lf` | `test_gitattributes_forces_lf_for_container_files` ✅ |
+
+一句话：**「测试通过」本身也需要被验证。** 尤其在用工具生成测试的时候，
+一个恒真的断言看起来和真断言一模一样。
+
+还有一条设计上的关键：那份「容器必须拿到哪些环境变量」的清单
+**不是手写的，而是从源码里反推的**——扫描 `api/ db/ src/ cache.py` 里所有
+`os.getenv("X")` 写法。手写清单会随代码漂移然后失效；反推的清单在加新配置的那一刻就会报红。
+（同一条思路还有一个副产品：它能反向查出「配了但没人读」的死配置。）
 
 ---
 

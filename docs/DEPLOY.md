@@ -9,8 +9,13 @@
 |---|---|
 | 镜像与编排文件（`Dockerfile` / `docker-compose.yml`） | ✅ 已写好 |
 | 部署脚本（`deploy.sh`） | ✅ 已写好 |
+| 编排文件之间的自洽性（compose / Dockerfile / `.dockerignore` / `.env` 模板） | ✅ 已用静态校验守住：`tests/test_deploy_manifest.py`（18 用例）+ 证明这些守卫会失败（7 用例），都在 CI 里 |
 | 本机跑通整个后端（真 MySQL + 假 Ollama + 真 uvicorn，27 项断言） | ✅ 已验证 |
 | **在真实容器里跑起来** | ❌ **还没验证过** —— 本机没有 WSL、内存 1G，跑不动 Docker |
+
+第 3 行是这轮补的。**「文件写好了」和「文件之间自洽」是两件事**：本机没 Docker，
+compose 里写错一个变量名也跑不到，所以改成用静态校验把能查的先查掉——
+凡是「只会在上云第一小时暴露」的问题，尽量挪到提交前。
 
 所以这份手册的步骤是「照着做就能上线」，但**第一次上云时如果有报错，属于预期内**，
 按下面「排查」一节逐项对。
@@ -28,6 +33,9 @@
 ## 2. 三步上线
 
 ```bash
+# ⓪ 先在本地跑一遍编排文件的自洽性校验（不需要 Docker）
+python -m unittest tests.test_deploy_manifest
+
 # ① 装 Docker（官方一键脚本）
 curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER      # 之后重新登录，否则 docker 命令要 sudo
@@ -41,6 +49,10 @@ cp .env.prod.example .env
 vi .env                            # 至少填 MYSQL_ROOT_PASSWORD（openssl rand -base64 24）
 bash deploy.sh
 ```
+
+第 ⓪ 步的用处：把「只会在上云第一小时才暴露」的那类问题（`.env` 被拷进镜像、
+`host.docker.internal` 在 Linux 上不解析、`.env` 里改了参数却没透传…）提前拦在本地。
+这些判断都是静态的，不需要 Docker，所以能在本机跑、也在每次 CI 里跑。
 
 `deploy.sh` 会依次做：前置检查（docker / compose / .env / 密码强度）→ `git pull`
 → `docker compose up -d --build` → 轮询 `/health/ready` 最多 180 秒 → 打印依赖状态
@@ -92,19 +104,22 @@ docker compose exec redis redis-cli
 
 | 场景 | 配置 | 注意 |
 |---|---|---|
-| 云主机上也装了 Ollama | `http://host.docker.internal:11434` | Linux 上 `host.docker.internal` 需要 compose 的 `extra_hosts` 映射（见下） |
+| 云主机上也装了 Ollama | `http://host.docker.internal:11434` | 已内置 `extra_hosts` 映射，无需手工配置（见下） |
 | Ollama 在另一台机器 | `http://<内网IP>:11434` | 优先走内网，别走公网 |
 | 暂时不接 | 保持默认 | 服务照常启动，`/health` 里 `ollama: false`，`/chat` 会返回错误事件 |
 
-Linux 上让 `host.docker.internal` 生效，给 api 服务加一段：
+关于 `host.docker.internal`：**Linux 上这个名字不会自动解析**——Docker Desktop for
+Mac/Windows 才自带它，Linux 原生 Docker 的设计是「显式 opt-in」。所以
+`docker-compose.yml` 里给 api 服务加了这段：
 
 ```yaml
     extra_hosts:
       - "host.docker.internal:host-gateway"
 ```
 
-（Docker Desktop for Mac/Windows 自带这个解析，Linux 需要显式声明。这是平台差异，
-不是配置写错。）
+（`host-gateway` 是 Docker 20.10+ 的特殊值，运行时替换为宿主机网关 IP。
+这是平台差异，不是配置写错。有 `tests/test_deploy_manifest.py` 守着——
+哪天有人把这行删了，CI 会红，而不是等到云主机上报 `Name or service not known`。）
 
 ⚠️ **公网暴露 Ollama 是危险的**：它默认无鉴权，任何人拿到地址就能白嫖你的算力，
 甚至通过 `/api/pull` 让你磁盘爆掉。要对外开放就先套一层带鉴权的反向代理。
@@ -147,6 +162,10 @@ server {
 | api 一直重启，日志 `Can't connect to MySQL` | 看 `docker compose logs mysql` 是不是初始化失败；`depends_on: service_healthy` 只保证「健康后再起 api」，若 mysql 自己起不来就要先修 mysql |
 | `/health` 里 `redis: false` | compose 里 api 的 `REDIS_URL` 必须用服务名 `redis`，不能用 127.0.0.1 |
 | `.sh` 报 `bad interpreter: /bin/bash^M` | 文件被转成了 CRLF。仓库里 `.gitattributes` 已声明 `*.sh text eol=lf`，若仍出问题，`sed -i 's/\r$//' deploy.sh` |
+| 日志里 `Name or service not known` / `could not resolve host: host.docker.internal` | Linux 不自动解析这个名字，需要 api 的 `extra_hosts`（compose 里已内置）。若你删过那一行，加回来 |
+| 在 `.env` 里改了 `TEMPERATURE` / `MAX_TOKENS` 但没生效 | compose 的 `.env` 只做**文件内插值**、不注入容器，api 的 `environment` 里必须显式透传这几个变量 |
+| 想确认镜像里没夹带密码 | `docker run --rm <image> cat /app/.env`（正常情况下应报 No such file）；根因是 `.dockerignore` 漏了 `.env` |
+| 建出来的表字符集不是 utf8mb4 | 检查 mysql 服务是不是用 `command: --character-set-server=utf8mb4` 起的。写成 `MYSQL_CHARSET` 环境变量**无效**（该变量不被 mysql 官方镜像支持，会被静默忽略） |
 | 想重新来一遍 | `docker compose down -v`（**-v 会删数据卷**，只在你确定不要数据时用） |
 
 ## 8. 回滚

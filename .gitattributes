@@ -15,6 +15,15 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
+# 容器相关文件必须是 LF。这两条不是洁癖，是会真出问题的：
+# - `.dockerignore` 的行尾如果是 \r，排除规则会匹配不上（模式变成 ".env\r"），
+#   于是 `.env` 照旧被 COPY 进镜像 —— 而且**不报错**，只是排除静默失效。
+# - `Dockerfile` 里 `RUN` 的续行（`\` 结尾）遇上 CRLF 会断开，命令被截在半路。
+# 这两类坑都只在「Windows 上检出、然后在别处构建」时才出现，本地很难复现。
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+*.yml text eol=lf
+
 # 这些是二进制，别做任何换行转换
 *.pt binary
 *.png binary
