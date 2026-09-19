@@ -31,7 +31,7 @@
 #   3. docker compose config 校验语法与变量插值 + 记录服务是否已在运行
 #   4. 起一个假 Ollama 绑在 0.0.0.0:11434（容器要通过 host.docker.internal 访问它）
 #   5. docker compose up -d --build
-#   6. 容器内断言：凭据没进镜像 / 非 root / 数据库端口没暴露到宿主机
+#   6. 容器内断言：凭据没进镜像 / 非 root / 数据库端口没暴露 / api 端口已暴露
 #   7. 等就绪 + 灌种子数据（必须 exec 进容器，因为 MySQL 刻意没对宿主机开端口）
 #   8. 从宿主机打发布端口跑端到端断言（tests/e2e/container_smoke.py）
 #   9. 失败时打印容器日志与状态，然后按上面的规矩收尾
@@ -209,20 +209,45 @@ UID_IN="$(docker compose exec -T api "$PY_IN" -c "print(__import__('os').getuid(
 ok "容器内 uid=${UID_IN}（非 root）"
 
 # ③ 数据库 / 缓存端口没有映射到宿主机，只有 api 暴露
+#
+# 两种错误方向都要防：
+#   真的映射了却没抓到 —— 公网上等于把数据库端口敞开；
+#   inspect 根本没拿到有效状态（返回 `{}`）却被当成「没有映射」——
+#   那是假绿：结论「安全」建立在「什么都没读到」上。
+# 所以先要求 ports 里至少列出该容器自己 EXPOSE 的端口（值可以是 null），
+# 拿不到就报错，而不是把它当成「没有暴露」放行。
 for svc in mysql redis; do
   cid="$(docker compose ps -q "$svc")"
   [[ -n "$cid" ]] || die "拿不到 $svc 的容器 id"
   ports="$(docker inspect --format '{{json .NetworkSettings.Ports}}' "$cid")"
+  echo "$ports" | grep -q 'tcp' \
+    || die "$svc 的端口信息为空（$ports）——inspect 没拿到有效状态，「未暴露端口」这个结论不成立"
   if echo "$ports" | grep -q 'HostPort'; then
     die "$svc 的端口被映射到了宿主机：$ports（公网上等于对外开了一个数据库端口）"
   fi
   ok "$svc 未向宿主机暴露端口（$ports）"
 done
+
+# api 必须把端口映射到宿主机，否则公网访问不到。
+#
+# 这里**必须等**：api 在 compose 里是 `depends_on: {...: service_healthy}`，
+# 三个容器里它最后启动，而脚本常常在它 Up 后不到 1 秒就走到这里 ——
+# 那一刻 Docker 还没把端口绑定写进 NetworkSettings.Ports，inspect 回来的是 `{}`。
+# 立刻断言会假红：实测 CI 上真的踩过，同一次提交原样重跑就绿了。
+# 关键不是「多等一会儿更稳」，而是**不等就测的不是这件事**。
+# 等不到仍然报错（fail-closed），只是把「时序没到」和「真没映射」区分开。
+# 上限写成变量：循环次数与报错文案同一个来源，改一处即可，不会漂移。
+PORT_WAIT_SECS=30
 apid="$(docker compose ps -q api)"
 [[ -n "$apid" ]] || die "拿不到 api 的容器 id"
-api_ports="$(docker inspect --format '{{json .NetworkSettings.Ports}}' "$apid")"
+api_ports=""
+for _ in $(seq 1 "$PORT_WAIT_SECS"); do
+  api_ports="$(docker inspect --format '{{json .NetworkSettings.Ports}}' "$apid" 2>/dev/null || true)"
+  if echo "$api_ports" | grep -q 'HostPort'; then break; fi
+  sleep 1
+done
 echo "$api_ports" | grep -q 'HostPort' \
-  || die "api 没有映射端口，外部访问不到（ports=$api_ports）"
+  || die "等了 ${PORT_WAIT_SECS}s，api 仍没有映射到宿主机的端口，外部访问不到（ports=$api_ports）"
 ok "api 已向宿主机暴露端口（$api_ports）"
 
 # ── 7. 等就绪 + 灌种子数据 ─────────────────────────────
