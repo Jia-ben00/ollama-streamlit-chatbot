@@ -5,7 +5,7 @@
 「测试全绿」本身不能证明测试有效 —— 断言写松了、写成恒真条件，一样全绿。
 唯一可靠的判据是：把缺陷种回去，看它会不会失败。
 
-本脚本覆盖四组：
+本脚本覆盖五组：
 
 | 分组 | 被测对象 | 对应用例 |
 |---|---|---|
@@ -13,11 +13,17 @@
 | `schema` | ORM 定义与快照（缺列 / 类型 / 枚举取值 / 可空性 / 索引 / 字符集声明 / 符号台账 / 快照少表） | `tests/test_schema_snapshot.py` |
 | `container_smoke` | `.github/scripts/container_smoke.sh` 的端口断言等待逻辑 | `tests/test_container_smoke_script.py` |
 | `stream_probe` | `src/stream_probe.py` 的「流式有没有退化成攒批」判据 | `tests/test_stream_probe.py` |
+| `nginx` | `deploy/nginx/templates/default.conf.template` + compose 挂载 + `.gitattributes`（关缓冲 / HTTP1.1 / Connection 置空 / 超时 / 上游用服务名 / 占位符全大写 / 模板真挂上） | `tests/test_nginx_config.py` |
 
 最后两组守的都不是业务代码，而是**判据本身**：一个量不出东西的尺子，
 和一个量出「一切正常」的尺子长得一模一样。`stream_probe` 那把尤其值得守——
 它错的时候部署是「能用的」，只是从「一个个蹦字」变成「转圈等到最后出全文」，
 没有报警、没有异常，只有到达时刻能看出来。
+
+`nginx` 这一组守的是**公网入口**这一层的配置。它的静态守卫（`test_nginx_config.py`）
+和 `container_smoke` 同属「本机看不出来、上云才知道」的那类：配置写错，本机没装
+nginx 也跑不出任何症状，要等 CI 第 9 步在真 nginx 容器上量到达时刻才会暴露。
+所以这里把每一句关键指令都种回一次，确认它真的被某条用例盯着。
 
 ## 设计上的三条硬要求
 
@@ -98,6 +104,26 @@ SPAN_RULE = '    if metrics["span"] < min_span:'
 FIRST_RULE = '    if float(metrics["first"] or 0.0) > first_ratio * max(total, 1e-9):'
 INCONCLUSIVE_BRANCH = "            INCONCLUSIVE,\n            metrics,"
 
+# ── nginx 组的锚点 ──────────────────────────────────────────────
+# 这一组守「公网入口」那一层：deploy/nginx/templates/default.conf.template
+# 里每一句关键指令，以及 compose 有没有把模板真挂进容器、.gitattributes 有没有
+# 钉住 LF。它们共同的特点是 —— 错了本机毫无症状（本机没装 nginx），
+# 只有上云 / CI 第 9 步才暴露，且暴露出来的现象（转圈等到最后出全文、
+# 反代连不上 api、容器起不来）都不是一条能看懂的报错。
+NGINX_TMPL = REPO / "deploy" / "nginx" / "templates" / "default.conf.template"
+COMPOSE = REPO / "docker-compose.yml"
+GITATTRIBUTES = REPO / ".gitattributes"
+TNX = "tests.test_nginx_config"
+
+BUFFERING_OFF = "proxy_buffering off;"
+HTTP11 = "proxy_http_version 1.1;"
+CONN_EMPTY = 'proxy_set_header Connection "";'
+READ_TIMEOUT = "proxy_read_timeout 300s;"
+PROXY_PASS = "proxy_pass http://${API_UPSTREAM};"
+SERVER_NAME_LINE = "server_name ${SERVER_NAME};"
+TEMPLATE_MOUNT = "./deploy/nginx/templates:/etc/nginx/templates:ro"
+GITATTR_TEMPLATE_LF = "*.template text eol=lf"
+
 GROUPS = {
     "chat_stream": [
         ("SSE Content-Type", CHAT,
@@ -174,6 +200,34 @@ GROUPS = {
         ("阈值参数不接线", PROBE, SPAN_RULE,
          '    if metrics["span"] < DEFAULT_MIN_SPAN:',
          TSP + ".TestRulerIsNotBlind.test_thresholds_actually_participate"),
+    ],
+    "nginx": [
+        # 静态守卫守的是「文件里那句规则还在不在」。把每一句关键指令改掉一次，
+        # 确认确实有某条用例在看它 —— 而不是「模板改坏了也没人发现」。
+        ("不关反代缓冲", NGINX_TMPL, BUFFERING_OFF, "proxy_buffering on;",
+         TNX + ".TestSseDirectives.test_buffering_is_off"),
+        ("对上游退化成 HTTP/1.0", NGINX_TMPL, HTTP11, "proxy_http_version 1.0;",
+         TNX + ".TestSseDirectives.test_upstream_connection_is_kept_alive"),
+        ("Connection 头没置空", NGINX_TMPL, CONN_EMPTY,
+         'proxy_set_header Connection "keep-alive";',
+         TNX + ".TestSseDirectives.test_upstream_connection_is_kept_alive"),
+        # 超时退回 nginx 默认值：模型稍慢就「聊到一半断开」，不是报错
+        ("读超时退回短值", NGINX_TMPL, READ_TIMEOUT, "proxy_read_timeout 60s;",
+         TNX + ".TestSseDirectives.test_timeouts_outlast_a_slow_model"),
+        # 写死 127.0.0.1：容器里的 localhost 指容器自己，反代永远连不上 api
+        ("上游写死 localhost", NGINX_TMPL, PROXY_PASS, "proxy_pass http://127.0.0.1:8000;",
+         TNX + ".TestSseDirectives.test_proxies_to_the_compose_service_not_localhost"),
+        # 占位符写成小写：envsubst 会把它替换成（通常为空的）环境变量，配置静默变形
+        ("占位符写成小写", NGINX_TMPL, SERVER_NAME_LINE, "server_name ${server_name};",
+         TNX + ".TestTemplateIsRenderable.test_placeholder_names_are_uppercase_only"),
+        # 模板没挂进容器：容器跑的是镜像自带 default.conf，仓库模板形同虚设
+        ("模板没挂进容器", COMPOSE, TEMPLATE_MOUNT,
+         "/tmp/not-the-repo:/etc/nginx/templates:ro",
+         TNX + ".TestComposeWiring.test_templates_are_mounted_from_the_repo"),
+        # 行尾策略被改：CRLF 模板进 Linux 容器，nginx 直接报错退出
+        ("模板不钉 LF", GITATTRIBUTES, GITATTR_TEMPLATE_LF,
+         "*.template text eol=crlf",
+         TNX + ".TestLineEndings.test_gitattributes_forces_lf_for_nginx_config"),
     ],
 }
 
