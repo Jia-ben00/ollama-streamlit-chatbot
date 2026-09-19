@@ -1,0 +1,368 @@
+{
+  "_readme": "练习库 schema 快照，由 tests/e2e/export_schema_snapshot.py 导出，tests/test_schema_snapshot.py 消费。只含结构、不含任何数据；想更新就重跑导出脚本，diff 里能看到改了什么。如果库那边改了 schema 而快照没跟着更新，守卫会报红——那通常是**该更新快照**，但要先确认改动本身是有意的。",
+  "source": {
+    "database": "chatbot",
+    "host": "127.0.0.1",
+    "exported_at": "2026-09-19 17:55:37",
+    "server_version": "8.0.46"
+  },
+  "tables": {
+    "conversation_tags": {
+      "collation": "utf8mb4_0900_ai_ci",
+      "engine": "InnoDB",
+      "columns": [
+        {
+          "name": "conversation_id",
+          "type": "bigint unsigned",
+          "nullable": false,
+          "key": "PRI",
+          "extra": ""
+        },
+        {
+          "name": "tag_id",
+          "type": "int unsigned",
+          "nullable": false,
+          "key": "PRI",
+          "extra": ""
+        }
+      ],
+      "indexes": [
+        {
+          "name": "PRIMARY",
+          "columns": [
+            "conversation_id",
+            "tag_id"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_ct_tag",
+          "columns": [
+            "tag_id"
+          ],
+          "unique": false
+        }
+      ]
+    },
+    "conversations": {
+      "collation": "utf8mb4_0900_ai_ci",
+      "engine": "InnoDB",
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint unsigned",
+          "nullable": false,
+          "key": "PRI",
+          "extra": "auto_increment"
+        },
+        {
+          "name": "user_id",
+          "type": "int unsigned",
+          "nullable": false,
+          "key": "MUL",
+          "extra": ""
+        },
+        {
+          "name": "model_id",
+          "type": "int unsigned",
+          "nullable": false,
+          "key": "MUL",
+          "extra": ""
+        },
+        {
+          "name": "title",
+          "type": "varchar(200)",
+          "nullable": false,
+          "key": "",
+          "extra": ""
+        },
+        {
+          "name": "is_archived",
+          "type": "tinyint(1)",
+          "nullable": false,
+          "key": "",
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "datetime",
+          "nullable": false,
+          "key": "",
+          "extra": "default_generated"
+        },
+        {
+          "name": "updated_at",
+          "type": "datetime",
+          "nullable": false,
+          "key": "",
+          "extra": "default_generated on update current_timestamp"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "PRIMARY",
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_conv_model",
+          "columns": [
+            "model_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_conv_user",
+          "columns": [
+            "user_id"
+          ],
+          "unique": false
+        }
+      ]
+    },
+    "messages": {
+      "collation": "utf8mb4_0900_ai_ci",
+      "engine": "InnoDB",
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint unsigned",
+          "nullable": false,
+          "key": "PRI",
+          "extra": "auto_increment"
+        },
+        {
+          "name": "conversation_id",
+          "type": "bigint unsigned",
+          "nullable": false,
+          "key": "MUL",
+          "extra": ""
+        },
+        {
+          "name": "role",
+          "type": "enum('system','user','assistant')",
+          "nullable": false,
+          "key": "",
+          "extra": ""
+        },
+        {
+          "name": "content",
+          "type": "text",
+          "nullable": false,
+          "key": "",
+          "extra": ""
+        },
+        {
+          "name": "token_count",
+          "type": "int unsigned",
+          "nullable": false,
+          "key": "",
+          "extra": ""
+        },
+        {
+          "name": "latency_ms",
+          "type": "int unsigned",
+          "nullable": true,
+          "key": "",
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "datetime",
+          "nullable": false,
+          "key": "MUL",
+          "extra": "default_generated"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_msg_conv",
+          "columns": [
+            "conversation_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_msg_created",
+          "columns": [
+            "created_at"
+          ],
+          "unique": false
+        },
+        {
+          "name": "PRIMARY",
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        }
+      ]
+    },
+    "models": {
+      "collation": "utf8mb4_0900_ai_ci",
+      "engine": "InnoDB",
+      "columns": [
+        {
+          "name": "id",
+          "type": "int unsigned",
+          "nullable": false,
+          "key": "PRI",
+          "extra": "auto_increment"
+        },
+        {
+          "name": "name",
+          "type": "varchar(60)",
+          "nullable": false,
+          "key": "UNI",
+          "extra": ""
+        },
+        {
+          "name": "provider",
+          "type": "varchar(30)",
+          "nullable": false,
+          "key": "",
+          "extra": ""
+        },
+        {
+          "name": "param_size",
+          "type": "varchar(10)",
+          "nullable": false,
+          "key": "",
+          "extra": ""
+        },
+        {
+          "name": "context_window",
+          "type": "int unsigned",
+          "nullable": false,
+          "key": "",
+          "extra": ""
+        },
+        {
+          "name": "is_active",
+          "type": "tinyint(1)",
+          "nullable": false,
+          "key": "",
+          "extra": ""
+        }
+      ],
+      "indexes": [
+        {
+          "name": "PRIMARY",
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        {
+          "name": "uk_models_name",
+          "columns": [
+            "name"
+          ],
+          "unique": true
+        }
+      ]
+    },
+    "tags": {
+      "collation": "utf8mb4_0900_ai_ci",
+      "engine": "InnoDB",
+      "columns": [
+        {
+          "name": "id",
+          "type": "int unsigned",
+          "nullable": false,
+          "key": "PRI",
+          "extra": "auto_increment"
+        },
+        {
+          "name": "name",
+          "type": "varchar(30)",
+          "nullable": false,
+          "key": "UNI",
+          "extra": ""
+        }
+      ],
+      "indexes": [
+        {
+          "name": "PRIMARY",
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        {
+          "name": "uk_tags_name",
+          "columns": [
+            "name"
+          ],
+          "unique": true
+        }
+      ]
+    },
+    "users": {
+      "collation": "utf8mb4_0900_ai_ci",
+      "engine": "InnoDB",
+      "columns": [
+        {
+          "name": "id",
+          "type": "int unsigned",
+          "nullable": false,
+          "key": "PRI",
+          "extra": "auto_increment"
+        },
+        {
+          "name": "username",
+          "type": "varchar(50)",
+          "nullable": false,
+          "key": "UNI",
+          "extra": ""
+        },
+        {
+          "name": "email",
+          "type": "varchar(120)",
+          "nullable": false,
+          "key": "UNI",
+          "extra": ""
+        },
+        {
+          "name": "plan",
+          "type": "enum('free','pro')",
+          "nullable": false,
+          "key": "",
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "datetime",
+          "nullable": false,
+          "key": "",
+          "extra": "default_generated"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uk_users_email",
+          "columns": [
+            "email"
+          ],
+          "unique": true
+        },
+        {
+          "name": "PRIMARY",
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        {
+          "name": "uk_users_username",
+          "columns": [
+            "username"
+          ],
+          "unique": true
+        }
+      ]
+    }
+  }
+}
