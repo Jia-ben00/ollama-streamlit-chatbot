@@ -382,7 +382,7 @@ bash .github/scripts/container_smoke.sh
 ## 🧪 运行测试
 
 ```bash
-# 全部测试（177 个用例，无需 Ollama / MySQL / Redis；界面测试用无头方式跑）
+# 全部测试（183 个用例，无需 Ollama / MySQL / Redis；界面测试用无头方式跑）
 python -m unittest discover tests -v
 ```
 
@@ -405,7 +405,7 @@ python -m unittest discover tests -v
 
 ### CI
 
-`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **177 passed**。
+`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **183 passed**。
 
 CI 里刻意**只装 `requirements.txt`**（不含 torch），并有一条 guard 步骤会在 torch 意外出现时直接失败：
 装了 torch 的话每次 run 要多下 2–3GB，这正是「本地跑通 ≠ CI 跑通」最常见的坑。
