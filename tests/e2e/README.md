@@ -164,6 +164,58 @@ API_BASE=http://127.0.0.1:8000 python tests/e2e/container_smoke.py
 > 收尾的规矩：只在「服务是本次运行自己拉起来的」时候才 `docker compose down -v`。
 > 在云主机上刚 `deploy.sh` 完再跑它，它检测到服务已在运行，就只做断言、**不会删数据卷**。
 
+## schema 快照：把「与练习库对齐」变成常驻守卫
+
+```bash
+# 只有这一步需要真 MySQL：把练习库结构导出成快照（只读 information_schema）
+export MYSQL_PASSWORD=你的密码
+python tests/e2e/export_schema_snapshot.py
+
+# 守卫本身不需要数据库，跑在 CI 里
+python -m unittest tests.test_schema_snapshot
+```
+
+`docs/interview-notes.md` 里说过「ORM 与练习库 6 张表是对齐的」。原来这句话只能靠
+**手工跑一次**来支撑，跑完就过去了，之后改列 / 改类型 / 改索引都不会有人拦。
+
+现在它变成 CI 里的常驻断言：快照（`tests/data/practice_db_schema.json`）签进仓库，
+`tests/test_schema_snapshot.py` 纯文件解析，比对「ORM 定义 vs 快照」。
+
+⚠️ **快照会过期**：库那头改了 schema，守卫会报红。那时要先判断「改动是否有意」，
+确认后才重跑导出脚本 —— diff 里能看清到底改了什么。
+
+导出脚本**显式写 LF**（`newline="\n"`）：`Path.write_text` 在 Windows 上会把 `\n`
+翻成 `\r\n`，同一份快照在两个平台上导出就会字节不同，diff 里全是噪音。
+
+## 反向对照：证明「守卫真的会红」
+
+```bash
+python tests/e2e/reverse_check.py            # 两个分组都跑
+python tests/e2e/reverse_check.py schema     # 只跑一组
+```
+
+**「测试全绿」不能证明测试有效** —— 断言写松了、写成恒真条件，一样全绿。
+唯一可靠的判据是把缺陷**种回去**，看它会不会失败。这个脚本自动做这件事：
+
+| 分组 | 种的缺陷 | 结果 |
+|---|---|---|
+| `chat_stream` | Content-Type / 防缓冲头 / SSE 空行分帧 / done 字段 / 404 校验 / 断连报错 / latency_ms 落库 | 7/7 全红 |
+| `schema` | 缺列 / 类型 / 枚举取值 / 可空性 / 索引 / 字符集声明 / 符号台账 / 快照少一张表 | 8/8 全红 |
+
+三条设计上的硬要求，都写在脚本头部注释里：
+
+1. **fail-closed**：任何一条「种回缺陷后还是绿的」都算失败；锚点找不到就**直接中止**，
+   绝不静默跳过 —— 否则脚本会假装跑过。
+2. **按字节还原 + 校验 sha256**。文本模式的 read/write 在 Windows 上会来回翻译
+   `\n` 与 `\r\n`，往返一趟就可能改写文件。**真踩过：把 `api/routers/chat.py` 写成
+   172 行 `\r\r\n`。** 那次恰好是脚本自检报了「文件没还原干净」——
+   **自检报的警必须查，不能归类成「格式噪音」。**
+3. 改一个、跑一个、立刻还原，不留中间态。
+
+> ⚠️ 这个脚本**会修改仓库里的源码文件**（改完立刻还原）。所以它放 `tests/e2e/`
+> 而不是 `tests/` —— 不匹配 `test*.py`，不进 CI、不会被误跑。
+> 运行期间不要同时编辑 `api/routers/chat.py` / `db/models.py` / 快照文件。
+
 ## 一个小提醒
 
 `setup_db.py` 会 **DROP 再 CREATE** 临时库（默认 `chatbot_api_e2e`）。别把它指向你的
