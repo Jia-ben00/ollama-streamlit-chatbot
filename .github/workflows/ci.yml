@@ -34,8 +34,11 @@ jobs:
       - name: Guard - torch must not leak into the default install
         run: python -c "import importlib.util, sys; leaked = importlib.util.find_spec('torch') is not None; print('torch installed:', leaked); sys.exit(1 if leaked else 0)"
 
+      - name: Guard - streamlit must be present (UI tests would otherwise silently skip)
+        run: python -c "from streamlit.testing.v1 import AppTest; print('AppTest available')"
+
       - name: Syntax check
-        run: python -m compileall -q app.py src sentiment_analysis tests
+        run: python -m compileall -q app.py src api db sentiment_analysis tests
 
       - name: Run unit tests
         run: python -m unittest discover tests -v

@@ -46,6 +46,24 @@ class ConversationOut(BaseModel):
     message_count: int = 0  # 聚合得来，不是 ORM 字段
 
 
+class ConversationUpdate(BaseModel):
+    """PATCH /conversations/{id} 的请求体：**局部更新**。
+
+    用 `Optional` + 默认 `None` 表达「本次不改这个字段」，而不是要求客户端
+    把整个会话对象发回来（PUT 的语义）。这就是 PATCH 与 PUT 的区别：
+    - PUT 是「用我给的完整对象替换你的」——客户端必须知道所有字段的当前值；
+    - PATCH 是「只改我说的字段」——客户端不知道的字段自然不会被误覆盖。
+
+    为什么这对前端很关键：前端切换模型时只知道 `model_id` 变了，并不知道
+    `title` 当前是什么。如果用 PUT，前端就得先 GET 一次再全量回填，
+    多一次往返，还可能在「读—改—写」之间覆盖掉别人的修改（丢失更新）。
+    """
+
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    model_id: Optional[int] = None
+    is_archived: Optional[bool] = None
+
+
 # ── 消息 ──────────────────────────────────────────────
 class MessageCreate(BaseModel):
     """发送消息的请求体（用户消息）。"""
@@ -88,3 +106,41 @@ class ChatResponse(BaseModel):
     reply: str
     model: str
     latency_ms: int
+
+
+# ── 目录（catalog）：模型与用户 ────────────────────────
+# 这两个接口是「前端接入后端」时才暴露出来的缺口：前端要建会话就必须知道
+# user_id 和 model_id，而这两个 id 来自数据库而不是前端硬编码。
+#
+# 为什么必须有它们：如果前端把 `user_id=1, model_id=1` 写死，那么库里的
+# 自增 id 一变（换台机器导入数据、重建库），前端就指向了错误的模型。
+# 这是「前端不应该知道数据库主键」这个原则的具体落地——但演示项目没有鉴权，
+# 所以退而求其次：让服务端告诉前端「有哪些可选」，而不是让前端猜。
+class ModelOut(BaseModel):
+    """模型响应。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    provider: str
+    param_size: str
+    context_window: int
+    is_active: bool
+
+
+class UserOut(BaseModel):
+    """用户响应。
+
+    注意这里**故意不含 email**：即便 `users` 表里有这一列，也不代表它该出现在
+    接口响应里。邮箱是 PII（个人身份信息），一个「给前端选当前用户」的下拉框
+    不需要它。Pydantic 的响应模型在这里起的是「白名单」作用——声明了才外泄，
+    没声明的字段（哪怕 ORM 对象上有）一律不出去。
+    这就是「为什么不要直接把 ORM 对象 return 出去」最直观的例子。
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    plan: str

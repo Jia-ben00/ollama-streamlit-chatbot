@@ -38,6 +38,41 @@ python tests/e2e/smoke.py
 
 `smoke.py` 会逐项打印 PASS/FAIL 并以退出码反映结果（0 = 全过），可以直接接进 CD 流程。
 
+## 前端全链路冒烟：验证「前端 → API → MySQL → Ollama」
+
+```bash
+export MYSQL_PASSWORD=你的密码
+python tests/e2e/frontend_smoke.py
+```
+
+它和 `smoke.py` 的分工是刻意分开的：
+
+- `smoke.py` 用裸 `requests` 打接口 → 验证**服务端**说得对（HTTP 层、落库、SSE 粒度）；
+- `frontend_smoke.py` 用**前端真正会用的那个客户端**（`src/api_client.ChatAPIClient`
+  + `src/chat_session.APIChatSession`）再走一遍 → 验证**前端拿到的世界对不对**。
+
+它会自动拉起假 Ollama 和 uvicorn（跑完清理），所以只需要 MySQL 在跑。实测输出：
+
+```
+── C. 流式对话 ──
+[OK]   回复内容与假 Ollama 的输出完全一致 reply='武汉今天多云，22 度，适合出门。'
+[OK]   块数与假 Ollama 推的一致 chunks=9
+       块到达间隔（毫秒）：[50, 51, 51, 51, 50, 51, 51, 50]
+[OK]   最大块间隔 < 200ms（没有攒批） max=51ms
+[OK]   拿到服务端实测的生成耗时 468ms
+── F. 切换模型 ──
+[OK]   服务端确认 model_id 已更新 model_id=2 期望=2
+...
+结果：30 通过 / 0 失败
+```
+
+**为什么要多写这一个脚本。** 接口用 curl 测得完美、前端接上去却是坏的，这种事很常见。
+最典型的一个坑是：服务端每 50ms 推一块，前端因为**客户端缓冲**每 200ms 才收到一批。
+`smoke.py` 看不到这个问题（它读流的姿势和前端不一样），只有用前端自己的客户端
+去读，那个数字才会暴露出来。
+
+一句话：**接口正确 ≠ 界面正确，中间那一层必须单独验。**
+
 ## 还有一个：N+1 的实证脚本
 
 ```bash

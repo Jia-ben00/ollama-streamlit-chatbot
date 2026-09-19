@@ -32,8 +32,14 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from api.deps import get_db
-from api.schemas import ConversationCreate, ConversationOut, MessageOut
-from db.models import Conversation, Message
+from api.schemas import (
+    ConversationCreate,
+    ConversationOut,
+    ConversationUpdate,
+    MessageOut,
+)
+from cache import cache
+from db.models import Conversation, Message, Model
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -138,21 +144,103 @@ def list_messages(
     return list(reversed(rows))
 
 
-@router.patch("/{conversation_id}", response_model=ConversationOut)
-def archive_conversation(
+@router.delete("/{conversation_id}/messages")
+def clear_messages(
     conversation_id: int,
     db: Session = Depends(get_db),
 ):
-    """归档会话（软删除）。"""
+    """清空会话的全部消息（会话本身保留，`messages` 表里对应行真删除）。
+
+    为什么是「清空消息」而不是「删除会话」：前端上那颗按钮的语义是「清空对话」，
+    用户想保留这个会话对象（标题、所属模型、标签都还在），只是把聊天记录抹掉。
+    如果做成删会话，用户回来发现会话没了，还得重新建一个——语义不匹配。
+
+    **这个接口里最关键的一行是 `cache.invalidate()`。**
+    缓存里存着「会话最近 20 条消息 = 喂给模型的上下文」。如果只删库不清缓存，
+    下一次提问时后端会把缓存里那些**已经被用户删掉的消息**重新拼进 prompt 发给
+    模型——模型会接着一段用户认为不存在的对话往下聊。这类 bug 极难排查，
+    因为接口全部返回成功、数据库里也确实没有那些行。
+
+    这就是「缓存失效」为什么必须和「写操作」绑在一起：**任何改变数据的路径，
+    都要问一句「我动了的那份数据，在缓存里有没有副本」**。T 掉 TTL 兜底是不够的，
+    TTL 只保证「最终一致」，中间这段时间用户看到的是错的。
+    """
+    exists = db.query(Conversation.id).filter(Conversation.id == conversation_id).first()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    # synchronize_session=False：直接下发 DELETE，不把 session 里已加载的对象逐个
+    # 同步（这里本来也没加载过 Message 对象），省一轮开销。
+    deleted = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+
+    # 先删库、再失效缓存。顺序不能反：反过来的话，万一 commit 失败，
+    # 缓存已经没了、库里还在，虽然结果一致（下次查询回源重建），但白丢一次缓存；
+    # 而在「删库成功、失效失败」的情况下，缓存虽然脏着，TTL 也会兜底。
+    # 更要紧的是：缓存失效放在 commit 之后，才不会把「未提交的数据」当成已生效。
+    cache.invalidate(conversation_id)
+
+    return {"conversation_id": conversation_id, "deleted": deleted}
+
+
+@router.patch("/{conversation_id}", response_model=ConversationOut)
+def update_conversation(
+    conversation_id: int,
+    payload: Optional[ConversationUpdate] = None,
+    db: Session = Depends(get_db),
+):
+    """局部更新会话：改标题 / 换模型 / 归档。
+
+    **为什么换模型要走这里**：`POST /chat` 的模型不是请求参数，而是「会话创建时
+    绑定在 conversations.model_id 上的」。这样设计的好处是「一个会话的模型是稳定的」
+    ——同一段对话不会因为前半段用 A 模型、后半段用 B 模型而变得上下文不连贯。
+    代价就是「用户想换模型」必须有地方改这个绑定，也就是这个 PATCH。
+
+    **兼容说明（真实的接口演进）**：不传 body 时按「归档」处理。这是第一版接口的
+    行为——当时 PATCH 只用来归档，语义完全隐式（光看路径看不出会归档），
+    `tests/e2e/smoke.py` 也依赖它。第二版既要支持换模型，又不能一脚踢翻老调用方，
+    所以选择「加可选字段 + 保留旧默认路径」，而不是另开一个 POST /archive
+    （那会让「同一个资源的不同字段更新」散落到多个端点，更乱）。
+    新代码请显式传 `{"is_archived": true}`，别依赖这个默认。
+    """
     conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if conv is None:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    conv.is_archived = True
+    if payload is None:
+        # 旧行为：无 body 即归档。
+        conv.is_archived = True
+    else:
+        # 只改显式传了的字段——这就是 PATCH 与 PUT 的区别：
+        # 客户端不必知道 title 当前是什么，也就不会把别人的修改覆盖掉。
+        if payload.title is not None:
+            conv.title = payload.title
+        if payload.model_id is not None:
+            # 显式校验外键目标存在。不查的话，非法 model_id 会在 commit 时撞外键约束，
+            # 冒出一个 500 IntegrityError；调用方拿到 500 只会以为是服务炸了。
+            # 在边界层拦下并返回 400，错误语义才是准的：
+            # 「外键约束」保证的是**数据一致性**，它不负责**错误语义**。
+            model_exists = (
+                db.query(Model.id).filter(Model.id == payload.model_id).first()
+            )
+            if model_exists is None:
+                raise HTTPException(status_code=400, detail="模型不存在")
+            conv.model_id = payload.model_id
+        if payload.is_archived is not None:
+            conv.is_archived = payload.is_archived
+
     db.commit()
     db.refresh(conv)
 
-    count = db.query(func.count(Message.id)).filter(Message.conversation_id == conversation_id).scalar()
+    count = (
+        db.query(func.count(Message.id))
+        .filter(Message.conversation_id == conversation_id)
+        .scalar()
+    )
     out = ConversationOut.model_validate(conv)
     out.message_count = count or 0
     return out

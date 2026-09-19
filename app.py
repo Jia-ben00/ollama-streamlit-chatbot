@@ -20,10 +20,36 @@ if os.path.isdir(_LIB_DIR):
 
 import streamlit as st
 
+from src.api_client import APIUnreachable, ChatAPIClient, ChatAPIError
+from src.chat_session import APIChatSession, ChatSession, LocalChatSession
 from src.config import get_config
 from src.ollama_client import OllamaClient
-from src.chatbot import ChatBot, DEFAULT_SYSTEM_PROMPT
-from src.utils import format_timestamp, estimate_tokens
+from src.chatbot import ChatBot
+from src.utils import format_timestamp
+
+
+# 数据源标识 → 界面标签。用标识（local/api）而不是标签做值，
+# 是为了让「界面文案」和「代码分支条件」解耦：以后改文案不用动逻辑。
+SESSION_LABELS = {
+    "local": "💾 本地直连（内存）",
+    "api": "🗄️ 后端 API（MySQL）",
+}
+
+
+def get_session(source: str) -> ChatSession:
+    """按数据源取出会话对象（懒创建 + 跨 rerun 保持）。
+
+    注意这里的 session_state 不是为了「缓存」，而是**必需品**：
+    Streamlit 每次交互都会把整个脚本从头到尾重新执行一遍，普通局部变量
+    活不过一轮 rerun。会话对象（尤其是那段对话历史）必须挂在
+    session_state 上，否则用户每发一条消息、界面刷新一次，
+    之前的对话就全丢了。这是写 Streamlit 应用要过的第一关。
+    """
+    if source == "api":
+        if "api_session" not in st.session_state:
+            st.session_state.api_session = APIChatSession(client=ChatAPIClient())
+        return st.session_state.api_session
+    return LocalChatSession(st.session_state.chatbot)
 
 
 # ── 页面配置 ──────────────────────────────────────────────
@@ -45,44 +71,25 @@ def init_session_state():
             generation_config=config.generation,
         )
         st.session_state.chatbot = ChatBot(client=client)
-    if "ollama_available" not in st.session_state:
-        st.session_state.ollama_available = None
-    if "available_models" not in st.session_state:
-        st.session_state.available_models = []
+
+    # 界面层状态：两个数据源共用同一套键，切换数据源时整体重置（见侧边栏）。
+    # 用 setdefault 而不是逐个 if，是为了新增状态时不会再漏掉一处。
+    for key, default in (
+        ("active_source", None),      # 当前数据源，用于检测「刚刚切换了」
+        ("service_ok", None),         # None=还没检测 / True / False
+        ("service_message", None),    # 给用户看的一句话
+        ("chat_models", []),          # 模型名列表（每轮 rerun 都请求一次太浪费）
+        ("export_data", None),        # 待下载的导出内容
+    ):
+        st.session_state.setdefault(key, default)
+
     if "sentiment_predictor" not in st.session_state:
         st.session_state.sentiment_predictor = None
     if "chinese_predictor" not in st.session_state:
         st.session_state.chinese_predictor = None
-    if "auto_detect_done" not in st.session_state:
-        st.session_state.auto_detect_done = False
-
-
-def auto_detect_ollama():
-    """启动时自动检测 Ollama 服务和本地模型，自动匹配可用模型。"""
-    if st.session_state.auto_detect_done:
-        return
-    st.session_state.auto_detect_done = True
-
-    chatbot = st.session_state.chatbot
-    try:
-        if chatbot.client.check_health():
-            st.session_state.ollama_available = True
-            models = chatbot.get_available_models()
-            st.session_state.available_models = models
-
-            # 如果默认模型不在本地列表中，自动切换到第一个可用模型
-            default_model = chatbot.client.config.model
-            if models and default_model not in models:
-                chatbot.set_model(models[0])
-        else:
-            st.session_state.ollama_available = False
-    except Exception:
-        st.session_state.ollama_available = False
 
 
 init_session_state()
-chatbot: ChatBot = st.session_state.chatbot
-auto_detect_ollama()
 
 
 # ── 侧边栏：模式选择 ──────────────────────────────────────
@@ -102,63 +109,159 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════
 if mode == "💬 智能聊天":
     with st.sidebar:
-        # Ollama 连接状态
-        st.subheader("服务状态")
-        if st.button("🔄 检测连接", use_container_width=True):
-            st.session_state.ollama_available = chatbot.client.check_health()
-            if st.session_state.ollama_available:
-                st.session_state.available_models = chatbot.get_available_models()
-                # 自动匹配可用模型
-                if st.session_state.available_models:
-                    default_model = chatbot.client.config.model
-                    if default_model not in st.session_state.available_models:
-                        chatbot.set_model(st.session_state.available_models[0])
-            else:
-                st.session_state.available_models = []
+        # ── 数据源 ──
+        st.subheader("数据源")
+        source = st.radio(
+            "对话数据存在哪里",
+            options=["local", "api"],
+            format_func=lambda s: SESSION_LABELS[s],
+            index=0,
+            key="data_source",
+            help=(
+                "本地直连：消息只在当前进程的内存里，关掉就没了（改造前的行为）。\n\n"
+                "后端 API：消息由 FastAPI 落进 MySQL，换台机器打开还在。"
+            ),
+        )
+        session = get_session(source)
 
-        if st.session_state.ollama_available is True:
-            model_count = len(st.session_state.available_models)
-            st.success(f"✅ Ollama 服务已连接（{model_count} 个模型）")
-        elif st.session_state.ollama_available is False:
-            st.error("❌ 无法连接 Ollama 服务")
-            st.info("请确保本地已安装并启动 Ollama：\n```\nollama serve\n```")
-        else:
-            st.info("正在自动检测...")
+        # 刚切换数据源：把上一个数据源的检测结果、模型列表、导出内容清掉。
+        # 不清的话会出现「拿 Ollama 的模型列表去建后端会话」这种串台。
+        if st.session_state.active_source != source:
+            st.session_state.active_source = source
+            st.session_state.service_ok = None
+            st.session_state.service_message = None
+            st.session_state.chat_models = []
+            st.session_state.export_data = None
 
         st.divider()
 
-        # 模型选择
+        # ── 服务状态 ──
+        # 「服务状态」在两种数据源下含义不同，所以它属于数据源、不属于聊天模块：
+        #   直连模式 → Ollama 通不通（通了才能生成）
+        #   后端模式 → API 通不通 + 它的三个依赖（数据库 / Redis / Ollama）通不通
+        # 界面代码不用关心这个差别，session.health() 返回统一的一句话。
+        st.subheader("服务状态")
+
+        # 首次进入（或刚切换数据源）自动检测一次，省掉用户一次点击。
+        if st.session_state.service_ok is None:
+            _ok, _msg = session.health()
+            st.session_state.service_ok = _ok
+            st.session_state.service_message = _msg
+
+        if st.button("🔄 检测连接", use_container_width=True):
+            ok, message = session.health()
+            st.session_state.service_ok = ok
+            st.session_state.service_message = message
+            st.session_state.chat_models = session.list_models() if ok else []
+
+        if st.session_state.service_ok:
+            st.success("✅ " + (st.session_state.service_message or "连接正常"))
+        else:
+            st.error("❌ " + (st.session_state.service_message or "连接失败"))
+            if session.kind == "api":
+                st.info("请先启动后端：\n```\nuvicorn api.main:app --port 8000\n```")
+            else:
+                st.info("请确保本地已安装并启动 Ollama：\n```\nollama serve\n```")
+
+        st.divider()
+
+        # ── 后端模式专属：服务端会话管理 ──
+        if session.kind == "api":
+            st.subheader("会话（服务端）")
+            if st.session_state.service_ok:
+                try:
+                    convs = session.list_conversations()
+                except ChatAPIError as exc:
+                    convs = []
+                    st.warning(str(exc))
+
+                if convs:
+                    labels = [
+                        f"#{c['id']} · {c['title']}（{c['message_count']} 条）"
+                        for c in convs
+                    ]
+                    index = next(
+                        (i for i, c in enumerate(convs)
+                         if c["id"] == session.conversation_id),
+                        0,
+                    )
+                    picked = st.selectbox(
+                        "选择会话",
+                        options=range(len(labels)),
+                        format_func=lambda i: labels[i],
+                        index=index,
+                        key="conv_picker",
+                    )
+                    session.open_conversation(convs[picked]["id"])
+                else:
+                    st.info("还没有会话，新建一个开始聊。")
+
+                with st.form("new_conversation", clear_on_submit=True):
+                    title = st.text_input("新会话标题", value="新会话")
+                    if st.form_submit_button("➕ 新建会话", use_container_width=True):
+                        available = st.session_state.chat_models or session.list_models()
+                        if not available:
+                            st.error("服务端没有可用模型，无法建会话。")
+                        else:
+                            try:
+                                session.create_conversation(title, available[0])
+                                st.session_state.chat_models = available
+                                st.rerun()
+                            except ChatAPIError as exc:
+                                st.error(str(exc))
+            else:
+                st.caption("后端不可用，先看上面的服务状态。")
+
+            st.divider()
+
+        # ── 模型设置 ──
         st.subheader("模型设置")
-        models = st.session_state.available_models
+        models = st.session_state.chat_models
+        if not models and st.session_state.service_ok:
+            try:
+                models = session.list_models()
+                st.session_state.chat_models = models
+            except Exception:  # noqa: BLE001 - 取不到模型列表不该让页面崩掉
+                models = []
+
         if models:
-            # 确保当前模型在列表中，否则自动选第一个
-            current = chatbot.current_model
+            current = session.current_model()
             if current not in models:
-                chatbot.set_model(models[0])
+                # 会话绑定的模型已下线 / 默认模型不在本地：落到第一个可用的，
+                # 而不是让下拉框空着（空着的选择器用户根本没法操作）。
+                session.set_model(models[0])
                 current = models[0]
             selected_model = st.selectbox(
                 "选择模型",
                 options=models,
                 index=models.index(current) if current in models else 0,
-                help="从本地 Ollama 已安装的模型中选择",
+                help="直连模式=本地 Ollama 已装的模型；后端模式=服务端 models 表里的模型",
+                key=f"model_picker_{source}",
             )
             if selected_model:
-                chatbot.set_model(selected_model)
+                session.set_model(selected_model)
         else:
-            st.warning("⚠️ 未检测到本地模型")
-            st.info("请先拉取模型，例如：\n```\nollama pull deepseek-r1:1.5b\n```")
-            st.caption(f"当前配置的默认模型：`{config.ollama.model}`")
+            st.warning("⚠️ 没有可用模型")
+            if session.kind == "local":
+                st.info("请先拉取模型，例如：\n```\nollama pull deepseek-r1:1.5b\n```")
+                st.caption(f"当前配置的默认模型：`{config.ollama.model}`")
 
         st.divider()
 
-        # 生成参数
+        # ── 生成参数 ──
         st.subheader("生成参数")
+        configurable = session.can_configure()
+        if not configurable:
+            st.caption("后端模式下生成参数由服务端统一提供，前端不可调（保证多端行为一致）。")
+
         temperature = st.slider(
             "Temperature（创造性）",
             min_value=0.0,
             max_value=2.0,
             value=float(config.generation.temperature),
             step=0.1,
+            disabled=not configurable,
+            key=f"temperature_{source}",
         )
         top_p = st.slider(
             "Top P（核采样）",
@@ -166,6 +269,8 @@ if mode == "💬 智能聊天":
             max_value=1.0,
             value=float(config.generation.top_p),
             step=0.05,
+            disabled=not configurable,
+            key=f"top_p_{source}",
         )
         max_tokens = st.number_input(
             "Max Tokens（最大长度）",
@@ -173,65 +278,95 @@ if mode == "💬 智能聊天":
             max_value=8192,
             value=int(config.generation.max_tokens),
             step=128,
+            disabled=not configurable,
+            key=f"max_tokens_{source}",
         )
-        chatbot.client.generation_config.temperature = temperature
-        chatbot.client.generation_config.top_p = top_p
-        chatbot.client.generation_config.max_tokens = int(max_tokens)
+        session.configure(temperature, top_p, int(max_tokens))
 
         st.divider()
 
-        # 系统提示词
+        # ── 系统提示词 ──
         st.subheader("系统提示词")
+        if not configurable:
+            st.caption("后端模式下提示词由服务端常量提供（api/routers/chat.py）。")
         system_prompt = st.text_area(
             "自定义 AI 角色",
-            value=chatbot.system_prompt,
+            value=session.system_prompt,
             height=100,
+            disabled=not configurable,
+            key=f"system_prompt_{source}",
         )
-        if st.button("应用提示词", use_container_width=True):
-            chatbot.set_system_prompt(system_prompt)
+        if st.button("应用提示词", use_container_width=True, disabled=not configurable):
+            session.set_system_prompt(system_prompt)
             st.success("提示词已更新")
 
         st.divider()
 
-        # 对话管理
+        # ── 对话管理 ──
         st.subheader("对话管理")
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🗑️ 清空", use_container_width=True):
-                chatbot.clear_history()
+                session.clear()
                 st.rerun()
         with col2:
             if st.button("📥 导出", use_container_width=True):
-                history_data = chatbot.export_history()
-                st.download_button(
-                    label="下载 JSON",
-                    data=json.dumps(history_data, ensure_ascii=False, indent=2),
-                    file_name=f"chat_history_{format_timestamp().replace(' ', '_').replace(':', '-')}.json",
-                    mime="application/json",
-                    use_container_width=True,
-                )
+                st.session_state.export_data = session.export()
+
+        # 下载按钮必须挂在 session_state 上，而不是写在「导出」按钮的分支里。
+        #
+        # 原因：Streamlit 里点击按钮会触发一次整页 rerun，下一轮 st.button 返回
+        # False，分支不再进入，那个 download_button 就随着重绘消失了——用户永远
+        # 点不到它。把内容先存进 session_state，再无条件渲染下载按钮，
+        # 才能让「导出」这个动作跨轮存活。（原版直连实现就踩了这个坑。）
+        if st.session_state.export_data is not None:
+            st.download_button(
+                label="下载 JSON",
+                data=json.dumps(
+                    st.session_state.export_data, ensure_ascii=False, indent=2
+                ),
+                file_name=f"chat_history_{format_timestamp().replace(' ', '_').replace(':', '-')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
 
         st.divider()
         st.subheader("统计")
-        st.metric("消息数", len(chatbot.messages))
-        st.metric("预估 Token", sum(estimate_tokens(m["content"]) for m in chatbot.messages))
+        message_count, token_count = session.totals()
+        st.metric("消息数", message_count)
+        st.metric("预估 Token", token_count)
 
     # ── 聊天主界面 ──
+    #
+    # 注意这一整段里**没有任何**「消息存在哪」的判断：history() / send() / clear()
+    # 都交给 session 对象，界面只管画。这就是抽出 ChatSession 的价值——
+    # 下面这些代码在「本地直连」和「后端 API」两种模式下跑的是同一份。
     st.title(f"💬 {config.title}")
-    st.caption(f"当前模型：`{chatbot.current_model}` ｜ 基于本地 Ollama 运行")
+    st.caption(
+        f"当前模型：`{session.current_model() or '未选择'}` ｜ "
+        f"数据源：{SESSION_LABELS[session.kind]}"
+    )
 
-    if not chatbot.messages:
-        st.info(
-            "👋 欢迎！在下方输入框中开始对话吧。\n\n"
-            "提示：请确保本地 Ollama 服务已启动（`ollama serve`），"
-            "并已拉取模型（如 `ollama pull llama3.2`）。"
-        )
+    history = session.history()
+    no_api_conversation = session.kind == "api" and session.conversation_id is None
 
-    for msg in chatbot.messages:
+    if not history:
+        if no_api_conversation:
+            st.info("👈 在左侧「会话（服务端）」里新建一个会话，就能开始对话了。")
+        else:
+            st.info(
+                "👋 欢迎！在下方输入框中开始对话吧。\n\n"
+                "提示：请确保本地 Ollama 服务已启动（`ollama serve`），"
+                "并已拉取模型（如 `ollama pull llama3.2`）。"
+            )
+
+    for msg in history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    user_input = st.chat_input("输入你的问题...", key="chat_input")
+    user_input = st.chat_input(
+        "输入你的问题...", key="chat_input", disabled=no_api_conversation
+    )
 
     if user_input:
         with st.chat_message("user"):
@@ -241,22 +376,30 @@ if mode == "💬 智能聊天":
             message_placeholder = st.empty()
             full_response = ""
             try:
-                for chunk in chatbot.generate_response_stream(user_input):
+                for chunk in session.send(user_input):
                     full_response += chunk
                     message_placeholder.markdown(full_response + "▌")
                 message_placeholder.markdown(full_response)
+
+                # 后端模式能拿到服务端实测的生成耗时（latency_ms 是落库字段），
+                # 顺手显示出来——这是「后端化」白捡的可观测性：
+                # 直连模式想知道耗时，得自己在界面里掐表。
+                latency = session.last_latency_ms
+                if latency:
+                    st.caption(f"本次生成耗时 {latency / 1000:.2f}s")
+            except APIUnreachable as e:
+                # 连不上后端：可能是没启动 API，也可能是地址配错了。
+                st.error(str(e))
+            except ChatAPIError as e:
+                st.error(f"后端返回错误：{e}")
             except ConnectionError as e:
                 st.error(str(e))
-                if chatbot.messages and chatbot.messages[-1]["role"] == "user":
-                    chatbot._messages.pop()
             except Exception as e:
                 st.error(f"生成回复时出错：{e}")
-                if chatbot.messages and chatbot.messages[-1]["role"] == "user":
-                    chatbot._messages.pop()
         st.rerun()
 
     st.divider()
-    st.caption("💡 基于 Streamlit + Ollama 构建，所有推理均在本地完成。")
+    st.caption("💡 基于 Streamlit + FastAPI + Ollama 构建，所有推理均在本地完成。")
 
 
 # ══════════════════════════════════════════════════════════

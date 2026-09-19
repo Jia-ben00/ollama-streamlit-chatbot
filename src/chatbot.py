@@ -63,6 +63,23 @@ class ChatBot:
         """清空对话历史。"""
         self._messages.clear()
 
+    def drop_last_user_message(self) -> bool:
+        """撤回最后一条用户消息（仅当它后面还没有回复时），返回是否撤回。
+
+        用途：生成失败时（Ollama 掉线、请求超时），把那句「发出去了但没得到回答」
+        的提问撤掉。不撤的话用户重试一次，上下文里就多一句重复的提问，
+        模型的回答会开始串味。
+
+        为什么把它放在这里、而不是让界面层自己 `_messages.pop()`：
+        「消息序列的规则」（user / assistant 成对出现、system 不混在里面）
+        本来就该由 ChatBot 维护。界面去直接改私有列表，等于把这条规则
+        复制到了每个调用点，早晚会有人忘了加那个「最后一条是不是 user」的判断。
+        """
+        if self._messages and self._messages[-1]["role"] == "user":
+            self._messages.pop()
+            return True
+        return False
+
     def reset(self) -> None:
         """完全重置会话状态。"""
         self.clear_history()

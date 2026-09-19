@@ -47,11 +47,13 @@ ollama-streamlit-chatbot/
 ├── .env.example                    # 环境变量示例
 ├── .gitignore
 ├── README.md
-├── src/                            # 领域层：聊天机器人核心逻辑
+├── src/                            # 领域层 + 客户端层
 │   ├── __init__.py
 │   ├── config.py                   # 配置管理
-│   ├── ollama_client.py            # Ollama REST API 客户端
+│   ├── ollama_client.py            # Ollama REST API 客户端（直连模式用）
 │   ├── chatbot.py                  # 聊天机器人核心逻辑
+│   ├── api_client.py               # 后端 API 客户端（后端模式用，消费 SSE）
+│   ├── chat_session.py             # 会话数据源抽象：直连 / 后端两种实现
 │   └── utils.py                    # 工具函数
 ├── api/                            # HTTP 层（FastAPI，后端化新增）
 │   ├── main.py                     # FastAPI 入口 + lifespan（连接池生命周期）
@@ -59,7 +61,8 @@ ollama-streamlit-chatbot/
 │   ├── schemas.py                  # Pydantic 请求/响应模型
 │   └── routers/
 │       ├── chat.py                 # POST /chat（SSE 流式）
-│       ├── conversations.py        # 会话 CRUD + 消息列表（显式 JOIN 防 N+1、游标分页）
+│       ├── conversations.py        # 会话 CRUD + 消息列表 / 清空 + 局部更新
+│       ├── catalog.py              # GET /models、GET /users（前端启动所需）
 │       └── health.py               # /health（存活+诊断）与 /health/ready（就绪）
 ├── db/                             # 数据层（SQLAlchemy ORM，后端化新增）
 │   ├── models.py                   # 6 张表的 ORM 映射（对齐本地 chatbot 库）
@@ -94,7 +97,11 @@ ollama-streamlit-chatbot/
 │   ├── __init__.py
 │   ├── test_chatbot.py             # 聊天模块单元测试（31 个用例）
 │   ├── test_api.py                 # API 层测试（TestClient + 假 Session）
-│   └── test_cache.py               # 缓存层测试（假 Redis，含降级行为）
+│   ├── test_api_client.py          # 前端客户端测试（SSE 解析、错误映射）
+│   ├── test_chat_session.py        # 会话抽象层测试（两种数据源的语义）
+│   ├── test_app.py                 # 界面测试（Streamlit AppTest 无头跑 app.py）
+│   ├── test_cache.py               # 缓存层测试（假 Redis，含降级行为）
+│   └── e2e/                        # 端到端（需外部服务，不进 CI，详见其 README）
 └── assets/
 ```
 
@@ -281,12 +288,45 @@ uvicorn api.main:app --reload --port 8000
 |---|---|---|
 | GET | `/health` | 存活 + 诊断：永远 200，body 里逐项报告 DB / Redis / Ollama |
 | GET | `/health/ready` | 就绪：依赖全通才 200，否则 503（给编排系统摘流量用） |
+| GET | `/models` | 可选模型列表（前端建会话需要 `model_id`） |
+| GET | `/users` | 用户列表（演示用，响应里不含 email） |
 | POST | `/conversations` | 创建会话 |
 | GET | `/conversations?user_id=` | 会话列表（含消息数，单条 SQL 防 N+1） |
 | GET | `/conversations/{id}` | 单个会话 |
 | GET | `/conversations/{id}/messages` | 消息列表（游标分页 `before_id`，任意页深成本恒定） |
-| PATCH | `/conversations/{id}` | 归档（软删除） |
+| DELETE | `/conversations/{id}/messages` | 清空消息（保留会话；会连带让上下文缓存失效） |
+| PATCH | `/conversations/{id}` | 局部更新：改标题 / **换模型** / 归档 |
 | POST | `/chat` | **SSE 流式对话**，流结束后落 assistant 消息并记 `latency_ms` |
+
+### 前端怎么接上后端
+
+原来的 Streamlit 界面是「进程内直连 Ollama」，它**完全不知道上面这些接口的存在**。
+把它接上去时做了两件事：
+
+1. `src/api_client.py` — HTTP 客户端，消费 `/chat` 的 SSE 流；
+2. `src/chat_session.py` — 把「一个会话」抽象成接口，给出两个实现：
+
+   | | `LocalChatSession` | `APIChatSession` |
+   |---|---|---|
+   | 消息存在哪 | 进程内存 | MySQL |
+   | 关掉页面 | 对话没了 | 还在 |
+   | 系统提示词 / 生成参数 | 可调 | 服务端统一提供（前端置灰并说明原因） |
+   | 换模型 | 改内存状态 | 改会话绑定的 `model_id`（写库） |
+
+于是界面代码**只写一遍**，用侧边栏的「数据源」下拉框切换。这就是「前后端分离」
+在代码里的具体样子——不是「有个 API 就算分离了」，而是**换后端不用改界面**。
+
+跑起来：
+
+```bash
+# 终端 1
+uvicorn api.main:app --port 8000
+# 终端 2（同项目目录）
+streamlit run app.py
+```
+
+在侧边栏把「数据源」切到 **🗄️ 后端 API（MySQL）** 即可：新建会话、切模型、
+清空对话都会真正落到数据库里；后端没启动时界面会给出启动命令，而不是报错页。
 
 ### 容器化部署
 
@@ -305,22 +345,35 @@ bash deploy.sh                          # 构建 + 起服 + 轮询就绪 + 打�
 ## 🧪 运行测试
 
 ```bash
-# 全部单元测试（45 个用例，全部 mock 离线运行，不需要 Ollama / MySQL / Redis）
+# 全部测试（116 个用例，无需 Ollama / MySQL / Redis；界面测试用无头方式跑）
 python -m unittest discover tests -v
 ```
 
 | 文件 | 覆盖内容 |
 |---|---|
 | `tests/test_chatbot.py` | 领域层：Ollama 客户端、聊天逻辑、工具函数（31 个） |
-| `tests/test_api.py` | HTTP 层：路由、参数校验、响应格式、游标分页、404/422、就绪探针 |
+| `tests/test_api.py` | HTTP 层：路由、参数校验、游标分页、404/422、就绪探针、目录接口、清空消息 |
+| `tests/test_api_client.py` | 前端客户端：SSE 分片解析、**读取粒度回归**、错误映射、连接释放 |
+| `tests/test_chat_session.py` | 会话抽象层：两种数据源的语义差异、失败降级 |
+| `tests/test_app.py` | 界面层：用 Streamlit `AppTest` 无头执行 `app.py`，验证首屏与数据源切换 |
 | `tests/test_cache.py` | 缓存层：TTL、主动失效、Redis 不可用时的降级 |
+
+> `tests/test_app.py` 是这一轮新增的能力：Streamlit 应用以前被认为「没法测」，
+> 现在用官方 `AppTest` 可以在无浏览器的情况下执行整个页面。它上线当天就抓到一个真问题——
+> 切到「后端 API」数据源、而后端没启动时，标题栏取当前模型抛异常、整页变红。
+> 修完之后，那条回归用例降级进了 `tests/test_chat_session.py`（毫秒级）。
+> **界面测试负责发现页面级问题，发现之后就该把它降级成单元测试守住。**
 
 ### CI
 
-`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **45 passed**。
+`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **116 passed**。
 
 CI 里刻意**只装 `requirements.txt`**（不含 torch），并有一条 guard 步骤会在 torch 意外出现时直接失败：
 装了 torch 的话每次 run 要多下 2–3GB，这正是「本地跑通 ≠ CI 跑通」最常见的坑。
+
+另有一条反向 guard：**确认 `streamlit` 真的装着**。因为界面测试在没有 streamlit 的机器上
+会 `skip` 而不是 `fail` —— 如果哪天依赖被误删，这些用例会安静地全被跳过，
+「CI 是绿的」就成了假象。**跳过不等于通过，所以要专门守一道。**
 
 ---
 
