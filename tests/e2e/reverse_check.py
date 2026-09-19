@@ -56,6 +56,29 @@ TOKEN_COL = '    token_count = Column(INTEGER(unsigned=True), nullable=False, se
 CREATED_IDX = "    created_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)"
 USERS_ARGS = '__tablename__ = "users"\n    __table_args__ = _table_args()'
 
+# ── container_smoke 组的锚点 ─────────────────────────────────────
+# 这一组被测的不是 Python 代码，而是 .github/scripts/container_smoke.sh 里
+# api 端口那条断言的**等待逻辑**。它值得单独守，因为它本身就是一次真实事故的产物：
+# api 在 compose 里 depends_on 另外两个 service_healthy，是最后一个启动的，
+# 脚本常在它 Up 后不到 1 秒就断言端口 —— 那一刻 Docker 还没把端口绑定写进
+# NetworkSettings.Ports，inspect 回来是 {}，于是 CI 假红一次（同提交重跑就绿）。
+CS = REPO / ".github" / "scripts" / "container_smoke.sh"
+TCS = "tests.test_container_smoke_script"
+
+WAIT_LOOP = '''for _ in $(seq 1 "$PORT_WAIT_SECS"); do
+  api_ports="$(docker inspect --format '{{json .NetworkSettings.Ports}}' "$apid" 2>/dev/null || true)"
+  if echo "$api_ports" | grep -q 'HostPort'; then break; fi
+  sleep 1
+done
+'''
+WAIT_LOOP_ONCE = '''api_ports="$(docker inspect --format '{{json .NetworkSettings.Ports}}' "$apid" 2>/dev/null || true)"
+'''
+HEALTH_TCP_CHECK = r'''  echo "$ports" | grep -q 'tcp' \
+    || die "$svc 的端口信息为空（$ports）——inspect 没拿到有效状态，「未暴露端口」这个结论不成立"
+'''
+API_PORT_DIE = r'''echo "$api_ports" | grep -q 'HostPort' \
+  || die "等了 ${PORT_WAIT_SECS}s，api 仍没有映射到宿主机的端口，外部访问不到（ports=$api_ports）"'''
+
 GROUPS = {
     "chat_stream": [
         ("SSE Content-Type", CHAT,
@@ -105,6 +128,15 @@ GROUPS = {
          TSS + ".TestWidthLedger.test_width_diffs_match_the_ledger_exactly"),
         ("快照里少了一张表", SNAPSHOT, '  "messages": {', '  "messages_RENAMED": {',
          TSS + ".TestTablesAndColumns.test_same_table_set_both_directions"),
+    ],
+    "container_smoke": [
+        ("端口断言不等就绪", CS, WAIT_LOOP, WAIT_LOOP_ONCE,
+         TCS + ".TestContainerSmokePortWait.test_端口晚于容器就绪出现时应等到而不是误报"),
+        ("丢空状态健全性检查", CS, HEALTH_TCP_CHECK, "",
+         TCS + ".TestContainerSmokePortWait.test_inspect_拿到空状态时不能被当成未暴露"),
+        ("端口缺失不再失败", CS, API_PORT_DIE,
+         '''echo "$api_ports" | grep -q 'HostPort' || true''',
+         TCS + ".TestContainerSmokePortWait.test_端口始终没有映射时应失败"),
     ],
 }
 

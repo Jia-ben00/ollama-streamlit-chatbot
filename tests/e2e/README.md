@@ -190,8 +190,9 @@ python -m unittest tests.test_schema_snapshot
 ## 反向对照：证明「守卫真的会红」
 
 ```bash
-python tests/e2e/reverse_check.py            # 两个分组都跑
-python tests/e2e/reverse_check.py schema     # 只跑一组
+python tests/e2e/reverse_check.py                  # 三个分组都跑
+python tests/e2e/reverse_check.py schema           # 只跑一组
+python tests/e2e/reverse_check.py container_smoke  # 只跑一组
 ```
 
 **「测试全绿」不能证明测试有效** —— 断言写松了、写成恒真条件，一样全绿。
@@ -201,6 +202,17 @@ python tests/e2e/reverse_check.py schema     # 只跑一组
 |---|---|---|
 | `chat_stream` | Content-Type / 防缓冲头 / SSE 空行分帧 / done 字段 / 404 校验 / 断连报错 / latency_ms 落库 | 7/7 全红 |
 | `schema` | 缺列 / 类型 / 枚举取值 / 可空性 / 索引 / 字符集声明 / 符号台账 / 快照少一张表 | 8/8 全红 |
+| `container_smoke` | 端口断言不等就绪 / 丢空状态健全性检查 / 端口缺失不再失败 | 3/3 全红 |
+
+最后一组值得单独说一句：它守的不是 Python 代码，而是 `container_smoke.sh` 里
+**api 端口那条断言的等待逻辑**。那条断言原本是「立刻 inspect，没有 HostPort 就失败」，
+而 api 在 compose 里是三个容器中最后一个启动的（`depends_on: service_healthy`），
+脚本常在它 Up 后不到 1 秒就走到断言处 —— 那一刻 Docker 还没把端口绑定写进
+`NetworkSettings.Ports`，inspect 回来是 `{}`，于是 CI 假红一次（**同一次提交原样重跑就绿**）。
+修法是把断言改成「等 30s，等不到仍报错」。但「改完 CI 绿了」证明不了任何事 ——
+这条断言本来就 flaky，绿是它的常态。所以 `tests/test_container_smoke_script.py`
+抽出脚本原文 + stub 掉 `docker` 命令，用三种确定性场景证明等待逻辑成立：
+晚到会等、始终缺失会失败、`inspect` 拿到空状态时不能把「什么都没读到」当成「安全」。
 
 三条设计上的硬要求，都写在脚本头部注释里：
 
