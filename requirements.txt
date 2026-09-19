@@ -1,6 +1,13 @@
-# 运行依赖（聊天模块 + 后续 API 层）
+# 运行依赖（聊天模块 + 后端 API 层）
 # 刻意不包含 torch / numpy —— 只有情感分析模块才需要，见 requirements-ml.txt
 streamlit>=1.30.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
+
+# 后端 API 层
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+sqlalchemy>=2.0.0
+pymysql>=1.1.0
+redis>=5.0.0

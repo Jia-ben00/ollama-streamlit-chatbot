@@ -43,12 +43,27 @@ ollama-streamlit-chatbot/
 ├── .env.example                    # 环境变量示例
 ├── .gitignore
 ├── README.md
-├── src/                            # 聊天机器人模块
+├── src/                            # 领域层：聊天机器人核心逻辑
 │   ├── __init__.py
 │   ├── config.py                   # 配置管理
 │   ├── ollama_client.py            # Ollama REST API 客户端
 │   ├── chatbot.py                  # 聊天机器人核心逻辑
 │   └── utils.py                    # 工具函数
+├── api/                            # HTTP 层（FastAPI，后端化新增）
+│   ├── main.py                     # FastAPI 入口 + lifespan（连接池生命周期）
+│   ├── deps.py                     # 依赖注入（DB session）
+│   ├── schemas.py                  # Pydantic 请求/响应模型
+│   └── routers/
+│       ├── chat.py                 # POST /chat（SSE 流式）
+│       ├── conversations.py        # 会话 CRUD（显式 JOIN 防 N+1）
+│       └── health.py               # GET /health（DB/Redis/Ollama 三探针）
+├── db/                             # 数据层（SQLAlchemy ORM，后端化新增）
+│   ├── models.py                   # 6 张表的 ORM 映射（对齐本地 chatbot 库）
+│   ├── session.py                  # 引擎 + 连接池 + get_db()
+│   └── init_db.py                  # 建表脚本
+├── cache.py                        # Redis 会话上下文缓存
+├── Dockerfile                      # 多阶段构建
+├── docker-compose.yml              # api + mysql + redis（healthcheck + depends_on）
 ├── sentiment_analysis/             # 情感分析模块
 │   ├── __init__.py
 │   ├── config.py                   # 模型超参数配置
@@ -67,7 +82,8 @@ ollama-streamlit-chatbot/
 │       └── training_history.json           # 训练历史
 ├── tests/
 │   ├── __init__.py
-│   └── test_chatbot.py             # 聊天模块单元测试（31 个用例）
+│   ├── test_chatbot.py             # 聊天模块单元测试（31 个用例）
+│   └── test_api.py                 # API 层测试（TestClient + mock）
 └── assets/
 ```
 
@@ -243,16 +259,19 @@ CI 里刻意**只装 `requirements.txt`**（不含 torch），并有一条 guard
 
 ## 🔧 技术栈
 
-| 模块 | 技术 |
+| 技术 | 说明 |
 |------|------|
-| Web 框架 | Streamlit |
+| Web 框架 | Streamlit（前端） / FastAPI（后端 API） |
 | 大模型推理 | Ollama（本地 LLM 服务） |
+| 数据库 | MySQL 8.0 + SQLAlchemy ORM |
+| 缓存 | Redis（会话上下文缓存） |
 | 深度学习框架 | PyTorch |
 | 情感模型 | BiLSTM（双向长短期记忆网络） |
 | HTTP 客户端 | requests |
 | 配置管理 | python-dotenv + dataclasses |
 | 测试 | unittest + mock |
 | CI | GitHub Actions（ubuntu-latest / Python 3.11） |
+| 容器化 | Docker + Docker Compose |
 
 ---
 

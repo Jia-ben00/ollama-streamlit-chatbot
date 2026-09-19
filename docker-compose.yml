@@ -1,0 +1,58 @@
+# docker-compose：一键拉起 api + mysql + redis。
+#
+# 面试必问：api 为什么等 MySQL 健康再起？（容器启动顺序 ≠ 服务就绪顺序）
+#
+# `depends_on` 默认只保证「mysql 容器先于 api 容器启动」，但 MySQL 容器「启动」
+# 只是进程起来了，此时它可能还在做初始化（建数据目录、跑 init 脚本、监听端口），
+# api 这时去连会报「connection refused」。所以不能只写 depends_on，还要：
+#   1. mysql 服务配 healthcheck（用 mysqladmin ping 探测真正就绪）；
+#   2. api 的 depends_on 用 condition: service_healthy —— 等 mysql 的健康检查
+#      通过后才启动 api。
+# 这样「启动顺序」才真正变成「就绪顺序」。
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      # 密码用环境变量注入（.env 提供），不把真实凭据写死进 compose 文件。
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-me}
+      MYSQL_DATABASE: chatbot
+      # 显式指定 utf8mb4 字符集，和练习库 / ORM 对齐，避免容器默认 latin1 存不了中文。
+      MYSQL_CHARSET: utf8mb4
+      MYSQL_COLLATION: utf8mb4_0900_ai_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      # mysqladmin ping 返回 0 表示 MySQL 真正能接受连接了。
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-change-me}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    environment:
+      # 容器内通过服务名 mysql / redis 互相访问（compose 自建网络 + DNS）。
+      DATABASE_URL: "mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-change-me}@mysql:3306/chatbot?charset=utf8mb4"
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    # api 启动后自动执行建表脚本，再起服务。
+    command: >
+      sh -c "python -m db.init_db && uvicorn api.main:app --host 0.0.0.0 --port 8000"
+
+volumes:
+  mysql_data:
