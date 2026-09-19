@@ -53,10 +53,15 @@ CONTEXT_LIMIT = 20
 
 
 def _build_context_messages(db: Session, conversation_id: int) -> List[Dict[str, str]]:
-    """从 DB 取会话最近 20 条消息作为上下文（优先走缓存）。"""
+    """取会话历史（最近 CONTEXT_LIMIT 条，**不含本次输入**），优先走缓存。
+
+    调用方必须保证在「本次用户消息落库之前」调用本函数 —— 否则读到的历史里
+    已经含了本次输入，再追加一次就会让模型看到两遍同一句话。
+    """
     cached = cache.get_context(conversation_id)
     if cached is not None:
-        return cached
+        # 返回副本：调用方会往这个列表上追加，不复制的话会原地改掉缓存里的对象。
+        return list(cached)
 
     rows = (
         db.query(Message)
@@ -97,7 +102,13 @@ def chat_stream(
     )
     model_name = model_row[0] if model_row else None
 
-    # 1. 落用户消息。
+    # 1. 先取历史上下文。
+    #    ⚠️ 这一步**必须在落库之前**。落库之后再查，查出来的最近 N 条里已经包含
+    #    本次输入，下面再 append 一次，模型就会看到两遍同一句话
+    #    （CONTEXT_LIMIT=20 实际只剩 10 句有效历史）。
+    history = _build_context_messages(db, conversation_id)
+
+    # 2. 落用户消息。
     user_msg = Message(
         conversation_id=conversation_id,
         role="user",
@@ -106,9 +117,8 @@ def chat_stream(
     db.add(user_msg)
     db.commit()
 
-    # 2. 组装上下文（历史 + 本次输入），交给 Ollama 流式生成。
-    history = _build_context_messages(db, conversation_id)
-    history.append({"role": "user", "content": user_content})
+    # 3. 组装本次请求的消息（历史 + 本次输入），交给 Ollama 流式生成。
+    request_messages = history + [{"role": "user", "content": user_content}]
 
     ollama = OllamaClient()
 
@@ -118,7 +128,7 @@ def chat_stream(
 
         try:
             for chunk in ollama.chat_stream(
-                messages=[{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}] + history,
+                messages=[{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}] + request_messages,
                 model=model_name,
             ):
                 full_reply.append(chunk)
@@ -140,8 +150,18 @@ def chat_stream(
         db.add(assistant_msg)
         db.commit()
 
-        # 主动失效缓存：上下文已变，下次不能再读旧缓存。
-        cache.invalidate(conversation_id)
+        # 写穿缓存：把本轮新增的「用户输入 + 模型回复」并入上下文后写回。
+        #
+        # 为什么不是 invalidate（删除）？删掉之后，下一次请求进来时缓存必然是空的，
+        # 于是每次都回 DB 重建 —— 读了缓存却永远 MISS，命中率恒为 0，
+        # Redis 这一层在功能上等于没接（且「写后立刻删」，setex 白做一次）。
+        #
+        # 为什么不是只 set 本轮两条？那会把更早的对话丢掉，命中缓存的请求只能
+        # 看到最近两句。所以要用「本轮用到的完整上下文 + 本轮回复」重建，再截断。
+        new_context = (
+            request_messages + [{"role": "assistant", "content": reply}]
+        )[-CONTEXT_LIMIT:]
+        cache.set_context(conversation_id, new_context)
 
         yield f"data: {json.dumps({'done': True, 'latency_ms': latency_ms}, ensure_ascii=False)}\n\n"
 
