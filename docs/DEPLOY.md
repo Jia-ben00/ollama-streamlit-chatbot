@@ -2,6 +2,7 @@
 
 目标：在一台云主机上把 `api + mysql + redis` 三个容器拉起来，让
 `http://<公网IP>:8000/health` 能被外面访问到。
+（可选但建议再加一层 nginx 反代，见 §6；启用后对外只开 80/443，8000 从安全组撤掉。）
 
 ## 0. 先说清楚现状（诚实标注）
 
@@ -9,21 +10,26 @@
 |---|---|
 | 镜像与编排文件（`Dockerfile` / `docker-compose.yml`） | ✅ 已写好 |
 | 部署脚本（`deploy.sh`） | ✅ 已写好 |
-| 编排文件之间的自洽性（compose / Dockerfile / `.dockerignore` / `.env` 模板） | ✅ 静态校验守着：`tests/test_deploy_manifest.py`（19 用例）+ 证明这些守卫真会失败（8 用例），都在 CI 里 |
+| 编排文件之间的自洽性（compose / Dockerfile / `.dockerignore` / `.env` 模板 / nginx 模板） | ✅ 静态校验守着：`tests/test_deploy_manifest.py`（20 用例）+ `tests/test_nginx_config.py`（14 用例）+ 证明这些守卫真会失败（8 用例），都在 CI 里 |
 | 本机跑通整个后端（真 MySQL + 假 Ollama + 真 uvicorn，27 项断言） | ✅ 已验证 |
 | **在真实 Docker 里把整套 compose 跑起来** | ✅ **CI 每次 push 真跑**：`.github/workflows/container-smoke.yml`。本机没 Docker，就用 GitHub runner 自带的 Docker——镜像能构建、容器之间能互通、容器内 MySQL 的表真是 utf8mb4、密码没被拷进镜像、3306/6379 没暴露 |
+| **反代这一层（Nginx + 流式不被攒批）** | ✅ **配置在仓库里，并且用真 nginx 跑过**：`deploy/nginx/templates/`，验收是 `.github/scripts/container_smoke.sh` 第 9 步（`tests/e2e/nginx_check.py`），带一个**必须被判成攒批的反例**。仍然没验的只剩「真实域名 + 证书」那一层，见 §6.2 |
 | **在云主机上对公网提供服务** | ❌ **还没做过** —— 缺一台能跑 Docker Compose 的 Linux 主机 |
 
-倒数第二行是这轮补上的，也是这个项目此前最弱的一点：**「文件写好了」和
-「真跑起来是对的」是两件事**。本机没有 WSL、内存 1G，跑不动 Docker，所以容器的
-真实验证一直缺位。补法有两层：
+最下面那行仍然是唯一没做到的：**还没有一台云主机**。上面的每一行都是这两轮补的，
+补的都是同一个东西：**「文件写好了」和「真跑起来是对的」是两件事**。
+本机没有 WSL、内存 1G，跑不动 Docker，所以「容器」和「反代」这两层的真实验证一直缺位。
+补法分三层，前两层管容器，第三层管反代：
 
-1. **静态校验**（`tests/test_deploy_manifest.py`，不需要 Docker，秒级）：凡是
-   「只会在上云第一小时暴露」的配置问题，尽量挪到提交前。
-2. **真跑一遍**（`.github/scripts/container_smoke.sh`，在 CI 的 Docker 上跑整套
+1. **静态校验**（`tests/test_deploy_manifest.py` + `tests/test_nginx_config.py`，
+   不需要 Docker，秒级）：凡是「只会在上云第一小时暴露」的配置问题，尽量挪到提交前。
+2. **真跑一遍容器**（`.github/scripts/container_smoke.sh`，在 CI 的 Docker 上跑整套
    compose）：静态校验只能证明「文件里写了正确的规则」，证明不了「规则真的生效」。
    比如 `.dockerignore` 里写了 `.env`，但要是文件被检出成 CRLF，规则会静默失效——
    静态校验照样绿，只有真去镜像里 `ls` 才发现密码躺在那里。
+3. **真跑一遍反代**（同一个脚本的第 9 步，用真 nginx 镜像 + 仓库那份模板）：
+   量 SSE 的真实到达时刻，并且**要求一个反例必须被判成攒批**——否则「正例通过」
+   说明不了任何事（一把恒真的尺子也长这样）。
 
 所以这份手册的步骤是「照着做就能上线」，但**第一次上云时如果有报错，属于预期内**，
 按下面「排查」一节逐项对。
@@ -33,6 +39,7 @@
 - 一台 Linux 云主机（ubuntu 22.04 / 24.04 都行）。规格：**2 核 2G 起**，1G 会很紧张
   （MySQL 一启动就吃掉大半内存，构建镜像时容易 OOM）。磁盘 20G 起。
 - 安全组放行：**22（SSH）** 和 **API_PORT（默认 8000）**。
+  如果启用 §6 的反代，那么放行 **80**、把 **8000 撤掉**。
   ⚠️ 不要放行 3306 / 6379 —— 见第 4 节。
 - 如果想让聊天功能真的能回复，主机上还要有 Ollama（见第 5 节）。
 
@@ -149,57 +156,85 @@ Mac/Windows 才自带它，Linux 原生 Docker 的设计是「显式 opt-in」�
 ⚠️ **公网暴露 Ollama 是危险的**：它默认无鉴权，任何人拿到地址就能白嫖你的算力，
 甚至通过 `/api/pull` 让你磁盘爆掉。要对外开放就先套一层带鉴权的反向代理。
 
-## 6. Nginx 反代（可选，但建议）
+## 6. Nginx 反代（可选，但上线建议开）
 
-直接暴露 8000 端口能用，但加上 Nginx 才能拿到 HTTPS。最小配置：
+直接暴露 8000 端口能用，但加上 Nginx 才能拿到 HTTPS、真实客户端 IP 和一层限流。
 
-```nginx
-server {
-    listen 80;
-    server_name your-domain.com;
+**配置不用你手抄**，仓库里就有：`deploy/nginx/templates/default.conf.template`。
+它交给 nginx 官方镜像的模板机制渲染——容器启动时会执行
+`docker-entrypoint.d/20-envsubst-on-templates.sh`，把模板里的 `${SERVER_NAME}` /
+`${API_UPSTREAM}` / `${LISTEN_PORT}` 换成容器环境变量的值，输出到 `/etc/nginx/conf.d/`。
+好处是**配置的单一来源在仓库里**：在服务器上手写一份 nginx.conf，下一次 `git pull`
+之后两边就漂移了，而且没有任何东西会提醒你。
 
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
+启用（compose 里 `proxy` 放在 `proxy` profile 下，默认不动）：
 
-        # ⚠️ SSE 必须关缓冲，否则 Nginx 会把流攒成一批再发（"流式"变"一次性"）
-        proxy_buffering off;
-        proxy_cache off;
-        proxy_read_timeout 300s;    # 大模型生成慢，别让代理提前掐断
-    }
-}
+```bash
+# .env 里填 SERVER_NAME（还没域名就留 `_`，用 IP 也能访问）
+docker compose --profile proxy up -d
 ```
 
-`proxy_buffering off` 这一条和代码里 `X-Accel-Buffering: no` 是同一件事的两道保险：
-应用主动告诉 Nginx 别缓冲，配置层再显式关一次。漏了会怎样见
-`docs/interview-notes.md` 第 5 节（那里有一个同类坑的实测数据）。
+拓扑变成 `公网 → nginx → api:8000 → mysql / redis`，nginx 与 api 走 compose 内网
+服务名互访，不需要经过宿主机端口。
 
-### 6.1 配完之后怎么验（只看行为，不看配置）
+> **启用反代后建议把安全组里的 8000 撤掉，只放行 80/443。** 否则别人可以绕过反代
+> 直连应用——以后加的限流/鉴权就都绕过去了。
+> 想在服务器本机直连调试的话，把 compose 里 api 的 `ports` 改成
+> `"127.0.0.1:${API_PORT:-8000}:8000"`：只绑回环，公网到不了，本机照常能查。
+
+### 6.1 怎么确认「流式没被反代攒批」
+
+```bash
+# ① 上云之前（本机 / CI）：真 nginx 容器 + 仓库那份模板，不用等服务器
+python tests/e2e/nginx_check.py
+
+# ② 上了公网之后，从**外面**（你的笔记本）跑
+python tests/e2e/public_check.py --url http://your-domain.com
+```
+
+第 ② 行**必须在另一台机器上跑**：在服务器上直连 8000 不经过 Nginx，等于没验。
+
+两个脚本都用裸 socket 记每块的真实到达时刻，判定回复是不是「逐块到达」。
+两种失败形态都拦得住：9 块全挤在几毫秒内（中间那层攒批）、
+首块直到最后才出现（上游生成完才吐）。
+
+`nginx_check.py` 还会起一个**必须被判成攒批的反例**（开着 `proxy_buffering`，
+上游换成 `tests/e2e/plain_sse.py`）——只有正例的话，「通过」什么都证明不了：
+一把恒真的尺子也长这样。完整对照表见 `tests/e2e/README.md`。
+
+> 一个反直觉的实测结论，值得知道：**nginx 对 chunked 分帧的响应本来就不攒批**，
+> 而我们的应用（uvicorn）正是 chunked。所以在当前形态下，配置里那句
+> `proxy_buffering off` 和响应头 `X-Accel-Buffering: no` 在客户端**观测不到差别**。
+> 留着它们是纵深防御（挡非 chunked 上游、gzip、proxy_cache 这几类形态），
+> 不是「靠它救命」。配置注释里也是这么写的，没把它说大。
+>
+> ⚠️ 一个容易搞反的点：`X-Accel-Buffering` 是应用发给**反代**看的头，
+> nginx 读到之后会**消费掉**它（实测：几种配置下客户端都收不到这个头）。
+> 所以公网侧的判据只能是**到达时刻**；「响应头里有 X-Accel-Buffering」
+> 属于**应用侧**的断言（`tests/test_chat_stream.py`），别把它搬到公网侧来用。
+
+### 6.2 HTTPS
+
+**本仓库的反代配置只管 HTTP**（这一层在 CI 里用真 nginx 跑过，见 §6.1）。
+TLS 不在这份配置里，需要额外加——原因很实在：ACME 签发要求一个真实域名指向一台
+有公网 IP 的机器，这个条件本项目**没有**，所以 TLS 那一层我们**没有验证过**，
+也就不提供一份没验过的证书配置（安全相关的配置写错的代价比没有更高）。
+
+两条可选路径：
+
+| 做法 | 说明 |
+|---|---|
+| 在更外层终结 TLS | 用云厂商的负载均衡 / CDN 挂证书，回源到这台机器的 80。改动最小，证书续期由云厂商管 |
+| 自己加 certbot | `certbot certonly --webroot` 签发，再把证书目录挂进 proxy 容器，并给 nginx 加一个 443 的 server 块。需要自己在模板里补，见 nginx 官方镜像文档 |
+
+无论走哪条，**效果都能用同一个判据验**：
 
 ```bash
 python tests/e2e/public_check.py --url https://your-domain.com
 ```
 
-**要在另一台机器上跑**（不是服务器上）：服务器上直连 8000 不经过 Nginx，
-验不到反代这一层，等于没验。
-
-它用裸 socket 记录每块的真实到达时刻，判定回复是不是「逐块到达」。两种失败形态都拦得住：
-9 块全挤在几毫秒内（中间那层攒批）、首块直到最后才出现（上游生成完才吐）。
-
-这个失败模式在本地就能复现——`tests/e2e/buffering_proxy.py` 是一个**故意攒批**的替身反代
-（它像 `proxy_buffering on` 一样把响应读完再一次性发出），拿它当靶子应当**变红**：
-
-```bash
-python tests/e2e/buffering_proxy.py                                      # 终端 A
-python tests/e2e/public_check.py --url http://127.0.0.1:8100 --no-ports   # 终端 B → 流式那条 FAIL
-```
-
-⚠️ 一个容易搞反的点：`X-Accel-Buffering` 是应用发给**反代**看的头，经 Nginx 之后
-很可能根本到不了客户端（我们**没有**在真 Nginx 上验证过这一点）。
-所以公网侧的判据只能是**到达时刻**；「响应头里有 X-Accel-Buffering」是**应用侧**单测的断言
-（`tests/test_chat_stream.py`），别把它搬到公网侧来用。
+它不看你用的是什么证书、什么拓扑，只量每块的到达时刻——HTTPS 之后流式是不是还活着，
+这才是唯一靠得住的判据。
 
 ## 7. 排查：第一次上云大概率会撞上的
 
@@ -216,6 +251,7 @@ python tests/e2e/public_check.py --url http://127.0.0.1:8100 --no-ports   # 终�
 | 在 `.env` 里改了 `TEMPERATURE` / `MAX_TOKENS` 但没生效 | compose 的 `.env` 只做**文件内插值**、不注入容器，api 的 `environment` 里必须显式透传这几个变量 |
 | 想确认镜像里没夹带密码 | `docker run --rm <image> cat /app/.env`（正常情况下应报 No such file）；根因是 `.dockerignore` 漏了 `.env` |
 | 建出来的表字符集不是 utf8mb4 | 检查 mysql 服务是不是用 `command: --character-set-server=utf8mb4` 起的。写成 `MYSQL_CHARSET` 环境变量**无效**（该变量不被 mysql 官方镜像支持，会被静默忽略） |
+| 反代起来之后，回复变成「转圈等到最后出全文」 | 先跑 `python tests/e2e/nginx_check.py`：它自带一个**必须被判成攒批的反例**，能把「尺子坏了」和「真被攒批了」区分开。常见成因是中间多了一层攒批（`proxy_buffering` 被改回去、链路上还有别的代理、或对 `text/event-stream` 开了 gzip）。判据只看到达时刻，见 §6.1 |
 | 日志里 `Name or service not known: cd@mysql` 之类的主机名很怪 | 密码里含 `@`。密码是被直接拼进 `DATABASE_URL` 的（`...//root:<密码>@mysql:3306/...`），而 URL 解析器在**第一个** `@` 处切断 userinfo——于是 `ab@cd` 被解析成密码 `ab` + 主机名 `cd@mysql`。实测确认过。改用 `openssl rand -hex 24`；`deploy.sh` 现在会提前拦住含 `@` 的密码 |
 | 想重新来一遍 | `docker compose down -v`（**-v 会删数据卷**，只在你确定不要数据时用） |
 
@@ -230,14 +266,16 @@ bash .github/scripts/container_smoke.sh
 **第二步，从外面验公网入口**（这一步上面那个脚本盖不住——它跑在服务器本机，不经过 Nginx）：
 
 ```bash
-python tests/e2e/public_check.py --url https://your-domain.com
+python tests/e2e/public_check.py --url http://your-domain.com   # 配了 TLS 就换 https
 ```
 
-三个验收脚本的分工（本机 / 服务器上 / 从外面）见 `tests/e2e/README.md`。
+四个验收脚本的分工（本机 / 服务器上 / 上云之前的反代层 / 从外面）见 `tests/e2e/README.md`。
 
 和 CI 里跑的是同一份脚本。它会逐项断言「容器化部署真的成立」，包括那些
 静态校验证明不了的：镜像里没有凭据、容器非 root、数据库端口没暴露、
 三个依赖探针全通、流式没有攒批、容器内 MySQL 真的能存 emoji。
+**第 9 步还会用真 nginx 容器再量一次 SSE 的到达时刻**（带一个必须被判成攒批的反例），
+也就是反代那一层在上云之前就已经验过了，不靠上线后才发现。
 
 检测到服务已在运行时会**只断言、不收尾**，不会删数据卷。
 

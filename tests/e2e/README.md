@@ -197,17 +197,19 @@ python tests/e2e/public_check.py --url https://your-domain.com
 python tests/e2e/public_check.py --url http://127.0.0.1:8000 --no-ports
 ```
 
-三个验收脚本的分工是**刻意分开**的，别混：
+四个验收脚本的分工是**刻意分开**的，别混：
 
-| 脚本 | 在哪跑 | 回答什么问题 |
-|---|---|---|
-| `smoke.py` | 本机 | 这套代码拼起来能跑吗（真 MySQL + 假 Ollama，不经反代） |
-| `.github/scripts/container_smoke.sh` | 服务器上 | **容器化部署**成立吗（镜像无凭据、非 root、端口不外露） |
-| `public_check.py` | **从外面** | **公网入口**成立吗（经 Nginx/HTTPS 之后，流式还是真流式吗） |
+| 脚本 | 在哪跑 | 需要什么 | 回答什么问题 |
+|---|---|---|---|
+| `smoke.py` | 本机 | 真 MySQL + 假 Ollama | 这套代码拼起来能跑吗（不经反代） |
+| `.github/scripts/container_smoke.sh` | 服务器上 / CI | Docker | **容器化部署**成立吗（镜像无凭据、非 root、端口不外露） |
+| `nginx_check.py` | 有 Docker 的机器 | compose 已在跑 | **反代这一层**成立吗（上云之前就能验） |
+| `public_check.py` | **从外面** | 一个能访问的 URL | **公网入口**成立吗（真的域名 / IP，经 HTTPS） |
 
-三个里只有最后一个能发现「反代把流攒批了」这一类问题 —— 而它恰恰是**最不容易被发现**的：
-功能完全正常、接口返回正确、落库也对，只是用户看到的从「一个字一个字蹦」变成
-「转圈等到最后出全文」。没有报错、没有告警，只有**到达时刻**能看出来。
+四个里只有 `nginx_check.py` 和 `public_check.py` 能发现「反代把流攒批了」这一类问题 ——
+而它恰恰是**最不容易被发现**的：功能完全正常、接口返回正确、落库也对，
+只是用户看到的从「一个字一个字蹦」变成「转圈等到最后出全文」。
+没有报错、没有告警，只有**到达时刻**能看出来。
 
 所以 `public_check.py` 用裸 socket 记录每块的真实到达时刻，判据在 `src/stream_probe.py`
 （那个判据本身也有单测和反向对照，见下）。
@@ -230,6 +232,57 @@ python tests/e2e/public_check.py --url http://127.0.0.1:8100 --no-ports    # 终
 
 ⚠️ 端口检查那部分自带**控制组**：先探一个已知开放的端口，连不上就直接报「探针自检失败」，
 而不是把后面几个「连不上」当成「安全」—— 否则结论就建立在「什么都没读到」上（假绿）。
+
+## 反代验收：`nginx_check.py`（在**真 nginx** 上量，不是替身）
+
+`public_check.py` 要你先把服务上线、再从另一台机器打进来。这个脚本把同一件事
+**提到上云之前**：用**同一个 nginx 镜像、同一份仓库模板**（`deploy/nginx/templates/`）
+起一个反代容器，接在正在跑的 compose 上，量 SSE 的到达时刻。
+
+```bash
+bash .github/scripts/container_smoke.sh     # 第 9 步就是它（CI 里每次都跑）
+python tests/e2e/nginx_check.py            # 也可以单独跑，前提是 compose 已在跑
+python tests/e2e/nginx_check.py --keep     # 失败时保留容器，便于进去看
+```
+
+它做两件事，**第二件比第一件重要**：
+
+1. 正例：仓库配置 → `api`（真应用）→ 必须判成 **INCREMENTAL**。
+2. 反例：把配置里的 `proxy_buffering` 打开 + 上游换成 `plain_sse.py` → 必须判成 **BUFFERED**。
+
+只有正例的话，「通过」什么都证明不了：一把恒真的尺子也长这样。
+反例必须红，才能说明这把尺子在这一层量得出东西 —— 和 `tests/test_stream_probe.py`
+里的能力检查是同一个道理，只是搬到了运行时。
+
+### 反例为什么用 `plain_sse.py` 而不是真应用
+
+**这是本轮踩出来的一个反直觉结论**：nginx 对 **chunked 分帧**的响应本来就不攒批。
+真应用（uvicorn）正是 chunked，所以拿它当反例，开着 `proxy_buffering` 也照样是增量的 ——
+反例红不了。`plain_sse.py` 用最朴素的分帧（靠关连接表示结束），那才是经典失败形态。
+
+本机用真 nginx（1.27.4）量出来的完整对照，同一个上游与配置每次只改一个变量：
+
+| 上游分帧 | 防缓冲头 | `proxy_buffering` | 观测（9 块） | 判定 |
+|---|---|---|---|---|
+| chunked（= 真应用） | 有 | off | 跨度 0.405s，首块 0.019s | ✅ INCREMENTAL |
+| chunked（= 真应用） | 有 | on | 跨度 0.404s，首块 0.035s | ✅ INCREMENTAL |
+| chunked（= 真应用） | 被 `proxy_ignore_headers` 无视 | on | 跨度 0.404s | ✅ INCREMENTAL |
+| 靠关连接结束 | 无 | off | 跨度 0.407s | ✅ INCREMENTAL |
+| 靠关连接结束 | 无 | **on** | **跨度 0.000s，首块 0.456s** | ❌ **BUFFERED** |
+
+两点结论：① 对 chunked 分帧，`proxy_buffering` 与那个头在客户端**观测不到差别**；
+② 对靠关连接结束的分帧，`proxy_buffering on` 会把整条响应攒完再发。
+所以配置里那句 `proxy_buffering off` 是**纵深防御**，不是「救命的那一句」——
+配置注释里也是这么写的，没把它说大。
+
+顺带一个**测出来的事实**（之前只是推测）：四种配置下，客户端**都看不到**
+`X-Accel-Buffering` 响应头 —— nginx 会消费掉它。所以公网侧的判据只能是到达时刻，
+「响应头里有 X-Accel-Buffering」只能作为**应用侧**的断言（`tests/test_chat_stream.py`）。
+
+⚠️ 写反例时踩的坑：第一版想用 `proxy_hide_header X-Accel-Buffering` 去「摘掉」应用那个头。
+它只影响**发给客户端**的头，而 nginx 是在上游模块里读到这个头当场就关掉缓冲的 ——
+看着把变量摘掉了，其实一点没摘，几个变体全是 INCREMENTAL，像是「配置怎么写都行」。
+**受控变量必须真的被控制住**，否则实验结论是假的（真正能无视它的是 `proxy_ignore_headers`）。
 
 ## 反向对照：证明「守卫真的会红」
 
