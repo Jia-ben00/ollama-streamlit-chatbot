@@ -157,11 +157,20 @@ class _ChatCase(unittest.TestCase):
     """公共脚手架：装好假 Session / 假 Ollama / 记录型缓存，跑若干轮对话。"""
 
     def setUp(self):
+        import api.routers.chat as chat_mod
+
+        # 下面替换的是**模块级**属性（不是 dependency_overrides 那种 per-app 的钩子），
+        # 必须记下原值并在 tearDown 还原：unittest discover 是同进程按文件名顺序跑的，
+        # 不还原就会把假缓存泄漏给之后执行的其它测试文件。
+        self._original_cache = chat_mod.cache
         self.cache = _RecordingCache()
         self.sent_batches = []
         self.app = app
 
     def tearDown(self):
+        import api.routers.chat as chat_mod
+
+        chat_mod.cache = self._original_cache
         app.dependency_overrides.clear()
 
     def _fake_chat_stream(self, messages=None, model=None, **kwargs):
