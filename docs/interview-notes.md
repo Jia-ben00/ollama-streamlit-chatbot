@@ -21,7 +21,9 @@
 | SSE 流式（服务端到客户端） | 9 个 chunk，块间隔均匀 **47ms**（服务端设定 50ms），`Content-Type: text/event-stream` |
 | SSE 流式（前端客户端读到的） | 9 个 chunk，块间隔 **[50, 51, 51, 51, 50, 51, 51, 50] ms** —— 前端侧没有二次缓冲 |
 | emoji 往返 | `表情测试 🚀😀🔥` 经 HTTP → MySQL → HTTP 无损，`@@character_set_connection = utf8mb4` |
-| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上 `docker compose up -d --build` 真跑整套：26 项断言（22 HTTP + 4 容器内）。本机没有 Docker，这是唯一能真跑容器的地方，详见第 9 节 |
+| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上 `docker compose up -d --build` 真跑整套，**22 项 HTTP 断言 + 4 项容器内断言全过，1 分 30 秒跑完**（run `35427086843`）。本机没有 Docker，这是唯一能真跑容器的地方，详见第 9 节 |
+| 容器里三个依赖探针 | `checks={"database":true,"redis":true,"ollama":true}` —— 分别证明「compose 服务名解析」「`REDIS_URL` 指向服务名」「`extra_hosts`/`host-gateway`」三处配置**真的生效**，而不只是写在文件里 |
+| 忽略规则与权限真的生效 | 容器内 `ls` 确认 `/app/.env`、`/app/.git`、`/app/tests`、`/app/app.py` 都不存在；容器内 `uid=1000`（非 root）；`mysql:{"3306/tcp":null}`、`redis:{"6379/tcp":null}`、`api: HostPort 8000` |
 | 公网访问（安全组 / Nginx / HTTPS） | ❌ 未验证 —— 缺一台能跑 Docker Compose 的云主机，见最后一节 |
 
 ---
@@ -399,6 +401,38 @@ badge 的含义就从「代码是对的」变成「代码是对的、而且今�
 
    这条的价值不在于改了哪行代码，而在于**先测量再动手**：凭直觉改会把
    「文档推荐了一个坏命令」这个错误结论写进仓库。
+
+### 真跑出来的证据（CI run `35427086843`，1m30s）
+
+```
+✓ compose 配置可解析，变量插值正常，extra_hosts 已声明
+✓ 假 Ollama 在 0.0.0.0:11434 监听（pid=2439）
+✓ 镜像里没有 .env / .git / tests / app.py / sentiment_analysis
+✓ 容器内 uid=1000（非 root）
+✓ mysql 未向宿主机暴露端口（{"3306/tcp":null,"33060/tcp":null}）
+✓ redis 未向宿主机暴露端口（{"6379/tcp":null}）
+✓ api 已向宿主机暴露端口（{"8000/tcp":[{"HostIp":"0.0.0.0","HostPort":"8000"},...]}）
+✓ 第 3 次探测：已就绪
+已灌种子：users=1 models=1
+
+[PASS] 容器能连上 MySQL 容器（compose 服务名解析） | checks={'database': True, 'redis': True, 'ollama': True}
+[PASS] 容器能连上 Redis 容器（REDIS_URL 指向服务名）
+[PASS] 容器能访问宿主机上的 Ollama（extra_hosts + host-gateway 生效）
+[PASS] /health/ready 返回 200（三依赖全通才就绪） | HTTP 200 {"status":"ready","checks":{...全 true}}
+[PASS] 流式返回 9 个 chunk（容器 -> 宿主机假 Ollama -> 容器） | reply='武汉今天多云，22 度，适合出门。'
+[PASS] 每块间隔贴合服务端节奏（容器链路没有攒批） | gaps=[0.05, 0.05, 0.051, 0.05, 0.05, 0.051, 0.05, 0.05]
+[PASS] 首块在 1 秒内到达 | 首块 0.015s / 总 0.47s
+[PASS] emoji 经「容器内 MySQL」往返无损（表字符集真的是 utf8mb4） | '表情测试 🚀😀🔥'
+...
+全部通过   （22 PASS / 0 FAIL + 8 项 shell 级检查）
+```
+
+其中三条最能证明「配置真的生效」而不只是「写在文件里」：
+
+- `redis: True` —— 如果把 `REDIS_URL` 删掉或写成 `127.0.0.1`，容器里的 127.0.0.1 是它自己，
+  这一项会变 `False`（而且**不报错**，只是永远不缓存）；
+- `ollama: True` —— `extra_hosts: host-gateway` 真的把 `host.docker.internal` 解析通了；
+- `emoji 往返无损` —— MySQL 容器接受了 `--character-set-server=utf8mb4`，表真的是 utf8mb4。
 
 ### 一个顺手发现的破坏性问题
 
