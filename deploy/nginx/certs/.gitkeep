@@ -1,0 +1,14 @@
+# 这个目录是反代（docker-compose.yml 的 proxy 服务）的证书挂载点。
+#
+# HTTPS 模式下，deploy/nginx/tls/default.conf.template 会从容器里的
+# /etc/nginx/certs/ 读两个**固定名字**的文件：
+#
+#   fullchain.pem   证书链（含中间证书）
+#   privkey.pem     私钥
+#
+# certbot 的 /etc/letsencrypt/live/<域名>/ 正好就是这两个名字，所以最常见的用法是把
+# .env 里的 TLS_CERT_DIR 指过去，而不是往这个目录里拷东西：
+#   TLS_CERT_DIR=/etc/letsencrypt/live/example.com
+#
+# ⚠️ 不要把自己的证书/私钥提交进这个目录：.gitignore 已经挡住了（私钥泄漏是不可逆的）。
+# 本文件（.gitkeep）只是让挂载点在仓库里存在。

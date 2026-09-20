@@ -14,11 +14,17 @@
 #   （替换的名字全大写是刻意的：nginx 的内置变量全是小写，两者不会撞名。）
 #
 # 为什么需要这一层、以及怎么验，见 docs/DEPLOY.md §6 / §6.1。
+#
+# 这是**明文**那一份：只监听 ${LISTEN_PORT}。要 HTTPS 就把 compose 里的配置源切到
+# deploy/nginx/tls/（见那份的文件头，以及 docs/DEPLOY.md §6.2）。两份模板共用同一段
+# location —— 下面用「共享段」标出来了，有守卫钉住它们**逐字节相同**：
+# 改了一份忘了另一份会直接红，不会静默漂移成两套行为。
 
 server {
     listen ${LISTEN_PORT};
     server_name ${SERVER_NAME};
 
+    # ==== 共享段开始 ====
     # ── SSE 的两道保险之一 ──────────────────────────────────────────
     #
     # 另一道在应用侧：/chat 的响应带 `X-Accel-Buffering: no`（见 api/routers/chat.py）。
@@ -52,4 +58,5 @@ server {
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
     }
+    # ==== 共享段结束 ====
 }

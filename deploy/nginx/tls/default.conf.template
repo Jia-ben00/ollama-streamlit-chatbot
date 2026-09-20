@@ -1,0 +1,103 @@
+# 公网入口的反向代理配置（HTTPS）。
+#
+# 这是 deploy/nginx/templates/default.conf.template 的 HTTPS 版本：**同一个 server
+# 块，只换监听方式**。除了监听 / 证书 / 跳转那几行，其余（尤其是那几条 SSE 指令）
+# 与那份**逐字节相同** —— 下面用「共享段」标出来了，有守卫钉住
+# （tests/test_nginx_config.py）。改一份忘了另一份会直接红，不会静默漂移。
+#
+# 启用（三件事，都在服务器上做；见 docs/DEPLOY.md §6.2）：
+#   ① .env: NGINX_TEMPLATES_DIR=./deploy/nginx/tls      ← 配置源换成这一份
+#   ② 证书按**固定名字**放进挂载目录：fullchain.pem + privkey.pem
+#      （certbot 的 live/<域名>/ 正好是这两个名字，直接指过去即可）
+#      .env: TLS_CERT_DIR=/etc/letsencrypt/live/<域名>
+#   ③ docker compose --profile proxy up -d
+# deploy.sh 会在 up 之前检查这两个文件在不在（证书缺了 nginx 起不来，报错很难懂），
+# 并在收尾时打印 https:// 入口。
+#
+# 本机怎么验（不需要域名、不需要真证书）：python tests/e2e/nginx_check.py
+# 它自签一张证书，把「TLS 之后流式还活着」「这把尺子在 TLS 下不瞎」「明文口确实在跳转」
+# 都量一遍。这一脚本在 CI 的容器冒烟第 9 步里跑。
+#
+# 占位符（由 nginx 官方镜像的 envsubst 渲染，见 docker-compose.yml 的注释）：
+#   SERVER_NAME / API_UPSTREAM / LISTEN_PORT / LISTEN_TLS_PORT
+# 证书路径**写死**在 /etc/nginx/certs/ 下：换名字要改下面两行。
+# 也不接受「证书放别处」——挂载点由 compose 固定，少一个能配错的地方。
+
+server {
+    # ── 明文入口：只做跳转 + ACME 挑战 ──────────────────────────────────
+    listen ${LISTEN_PORT};
+    server_name ${SERVER_NAME};
+
+    # ACME 的 http-01 挑战走 80 明文（certbot 的 webroot 要在那里读到挑战文件），
+    # 所以它必须排在跳转**之前**单独放行。否则续期会在「还有 30 天到期」时静默失败，
+    # 然后证书到期、整个站点打不开。没挂这个目录也没关系：没有挑战文件时它就是 404。
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # 其余明文一律跳 HTTPS。用 $host（不含端口）—— 默认布局（80 → 443）下拼出来正好对。
+    # ⚠️ 把 HTTPS 放在非 443 端口上时要改这一行（本机验收正是那种情形，所以它对
+    #    Location 只断言 scheme 与 path、不照抄端口，见 tests/e2e/nginx_check.py）。
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen ${LISTEN_TLS_PORT} ssl;
+    server_name ${SERVER_NAME};
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    # 只开 TLS 1.2 / 1.3。nginx 1.27 的默认值本来就是这样，写出来是为了让它出现在
+    # diff 里：哪天有人为了兼容旧客户端放开到 1.0 / 1.1，评审时看得见。
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # 会话复用：SSE 是长连接，省下的握手有限，但零成本。
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # 两件**故意没做**的事，都因为「没验过的东西不写进配置」：
+    #   · 没开 HTTP/2（`listen ... ssl http2;`）：h2 会多引入一层分帧与多路复用，
+    #     而这一层没量过。要开就先在 nginx_check.py 里把到达时刻量一遍。
+    #   · 没加 HSTS（Strict-Transport-Security）：浏览器一旦记住就**很难回退**
+    #     （要等 max-age 过期，期间站点直接打不开）。等证书续期这条路真跑顺了再加。
+    #     见 docs/DEPLOY.md §6.2。
+
+    # ==== 共享段开始 ====
+    # ── SSE 的两道保险之一 ──────────────────────────────────────────
+    #
+    # 另一道在应用侧：/chat 的响应带 `X-Accel-Buffering: no`（见 api/routers/chat.py）。
+    #
+    # ⚠️ 说清楚这一句在我们的形态下到底起不起作用，别把它当成「救命的那一句」：
+    # 应用用 **chunked** 分帧（uvicorn 的默认），而 nginx 对 chunked 响应本来就不攒批 ——
+    # 实测开不开、有没有那个头，客户端观测到的到达时刻都一样。
+    # 留着它是因为零成本，而且它挡的是另外几种形态：上游不用 chunked、
+    # 开了 gzip（gzip 过滤器会攒）、开了 proxy_cache。
+    # 实测证据（nginx 1.27.4，同一台机器、只改一个变量）：上游「靠关连接表示结束」时，
+    # `proxy_buffering on` 会把 9 个块挤在 0.000s 一起发（客户端看到的是转圈等到最后
+    # 出全文），加上这一句就恢复成 9 块分布在 0.405s —— 完整表格见 docs/DEPLOY.md §6.1。
+    proxy_buffering off;
+    proxy_cache off;
+
+    location / {
+        proxy_pass http://${API_UPSTREAM};
+
+        # SSE 是长连接。用 HTTP/1.1 且**把 Connection 头置空**，nginx 才会对上游用
+        # keep-alive；否则每个事件之间都可能被当作「一次性请求」处理。
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 大模型生成慢（OLLAMA_TIMEOUT 默认 120s）。nginx 默认 60s 会在长回复上
+        # 提前掐断上游连接 —— 表现为「聊到一半断开」，而不是一条能看懂的报错。
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+    # ==== 共享段结束 ====
+}

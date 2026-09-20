@@ -46,6 +46,11 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# 反代证书目录：只留一个占位文件，私钥与证书一律不进仓库。
+# （守卫：tests/test_nginx_config.py 会检查仓库里没有任何 .pem/.key/.crt 被跟踪。）
+deploy/nginx/certs/*
+!deploy/nginx/certs/.gitkeep
+
 # Testing
 .pytest_cache/
 .coverage
