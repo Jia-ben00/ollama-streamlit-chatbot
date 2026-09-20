@@ -58,7 +58,15 @@ services:
       start_period: 5s
 
   api:
-    build: .
+    build:
+      context: .
+      # 透传 pip 源给 Dockerfile 的 ARG。默认官方 PyPI（和 Dockerfile 的默认值一致）；
+      # 在 .env 里写一行 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+      # 就能把那一层从数小时压到两分钟 —— 实测见 Dockerfile 里的注释。
+      # 注意 compose 的 .env 只负责**文件内插值**，不会自动注入容器环境；
+      # 但 build.args 走的正是插值这条路，所以这里能生效。
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
     restart: unless-stopped
     environment:
       # 容器内通过服务名 mysql / redis 互相访问（compose 自建网络 + DNS）。
@@ -85,7 +93,12 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       # 只暴露 API。端口可用 .env 里的 API_PORT 覆盖（默认 8000）。
-      - "${API_PORT:-8000}:8000"
+      #
+      # API_BIND 是**绑定地址**，默认 0.0.0.0（所有网卡）。
+      # 启用反代时（`--profile proxy` / `deploy.sh --proxy`）应当改成 127.0.0.1：
+      # 否则外面可以绕过反代直连 8000，HTTPS / 限流 / SSE 防缓冲那一层就白配了。
+      # 这一条由 `deploy.sh --proxy` 提前拦住，不靠人记得改。
+      - "${API_BIND:-0.0.0.0}:${API_PORT:-8000}:8000"
     depends_on:
       mysql:
         condition: service_healthy
