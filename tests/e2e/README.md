@@ -161,6 +161,19 @@ API_BASE=http://127.0.0.1:8000 python tests/e2e/container_smoke.py
    脚本里改成让被测命令输出一个固定标记（如 `LEAKCHECK=CLEAN`），拿不到标记就报错——
    **所有检查都 fail-closed**。
 
+第三条是 2026-09-20 本机首跑时新加的，值得单独说，因为它推翻了前面那句「绑 0.0.0.0 就对了」：
+
+3. **端口通了 ≠ 连到的是我们的假 Ollama。** 开发机上装着一个真的 Ollama
+   （占 `127.0.0.1:11434`），而 **Windows 允许 `0.0.0.0:11434` 与它同时绑定**
+   （Linux 会直接 `EADDRINUSE`）。于是替身照样起来、脚本打印「已监听」，容器却连到了
+   真 Ollama：`/health` 里 `ollama: true`（真 Ollama 答的 `/api/tags`），`/chat` 返回
+   404 `model 'llama3.2' not found`，脚本只报「流式返回 0 个 chunk」——**看不出是连错了服务**。
+   Linux 上同一个洞换一种表现：替身 bind 失败，而「等端口」被**别人**应答，脚本照样成功。
+   所以现在有两处 fail-closed 检查：起替身**之前**确认端口没被占（占用就早停并给出改法：
+   停掉它，或 `FAKE_PORT=11500 OLLAMA_BASE_URL=http://host.docker.internal:11500` 换个端口），
+   起完再核**指纹**（`/api/tags` 里那条只有替身会返回的记录），并在**容器里**再验一次
+   （容器走的路径和宿主机不是同一条）。
+
 > 收尾的规矩：只在「服务是本次运行自己拉起来的」时候才 `docker compose down -v`。
 > 在云主机上刚 `deploy.sh` 完再跑它，它检测到服务已在运行，就只做断言、**不会删数据卷**。
 
@@ -216,7 +229,8 @@ python tests/e2e/public_check.py --url http://127.0.0.1:8000 --no-ports
 
 `buffering_proxy.py` 是**故意攒批**的替身反代（模拟 `proxy_buffering on`：把上游响应
 读完再一次性发，并且像 Nginx 一样不把 `X-Accel-Buffering` 转发给客户端）。
-本机没有 Docker / Nginx，没有它就没法复现这个失败模式：
+写它的理由：本机当时没有 Docker / Nginx，没有它就没法在上云**之前**复现这个失败模式
+（装好 Docker 之后可以再用真 nginx 验一遍，那就是 `nginx_check.py`，见下）：
 
 ```bash
 python tests/e2e/buffering_proxy.py                                       # 终端 A
@@ -302,19 +316,24 @@ python tests/e2e/nginx_check.py --keep     # 失败时保留容器，便于进�
 顺带把 stub 从宿主机挪进同一个 compose 网络：既少一个 `host.docker.internal` 环节，
 又和生产里「上游是网络内服务名」同形。
 
-> ⚠️ 值得单独记一笔：这台开发机**没有 Docker**，所以 `nginx_check.py` 在上云之前
+> ⚠️ 值得单独记一笔：这台开发机当时**没有 Docker**，所以 `nginx_check.py` 在上云之前
 > **从来没有真正执行过** —— CI 上的第一次运行就是它的第一次运行，而它连着红了两次。
 > **「本机验不了」不等于「可以先不验」**：静态守卫能证明「文件里写了正确的规则」，
 > 但证明不了「这个脚本自己跑得起来」，后者只有真跑能兜住。
+>
+> （2026-09-20 补：开发机已经装上 Docker（Desktop 4.91 / 引擎 29.8.0 / compose v5.5.1），
+> 于是 `nginx_check.py` 和整套容器冒烟现在**本机就能跑**。但上面那条教训不变 ——
+> 它能被本机跑，是因为有人先把「这东西从没跑过」当成缺陷去处理了。）
 
 ## 反向对照：证明「守卫真的会红」
 
 ```bash
-python tests/e2e/reverse_check.py                  # 五个分组都跑
+python tests/e2e/reverse_check.py                  # 六个分组都跑
 python tests/e2e/reverse_check.py schema           # 只跑一组
 python tests/e2e/reverse_check.py container_smoke  # 只跑一组
 python tests/e2e/reverse_check.py stream_probe     # 只跑一组
 python tests/e2e/reverse_check.py nginx            # 只跑一组
+python tests/e2e/reverse_check.py deploy_script    # 只跑一组
 ```
 
 **「测试全绿」不能证明测试有效** —— 断言写松了、写成恒真条件，一样全绿。
@@ -324,9 +343,10 @@ python tests/e2e/reverse_check.py nginx            # 只跑一组
 |---|---|---|
 | `chat_stream` | Content-Type / 防缓冲头 / SSE 空行分帧 / done 字段 / 404 校验 / 断连报错 / latency_ms 落库 | 7/7 全红 |
 | `schema` | 缺列 / 类型 / 枚举取值 / 可空性 / 索引 / 字符集声明 / 符号台账 / 快照少一张表 | 8/8 全红 |
-| `container_smoke` | 端口断言不等就绪 / 丢空状态健全性检查 / 端口缺失不再失败 | 3/3 全红 |
+| `container_smoke` | 端口断言不等就绪 / 丢空状态健全性检查 / 端口缺失不再失败 / 假 Ollama 的端口守卫恒判空闲 | 4/4 全红 |
 | `stream_probe` | 尺子不判跨度 / 块数不足当通过 / 尺子不判首块位置 / 阈值参数不接线 | 4/4 全红 |
 | `nginx` | 不关缓冲 / 退化成 HTTP1.0 / Connection 没置空 / 超时退回 60s / 上游写死 127.0.0.1 / 占位符小写 / 模板没挂进容器 / 模板不钉 LF | 8/8 全红 |
+| `deploy_script` | 密码行缺失时静默退出 / 空密码 / 默认密码 / 含 `@` 密码 / 缺 .env 不给修法 / 参数打错不报错 / `--no-pull` 失效 / `--proxy` 不查 API_BIND / 起反代不带 profile / 就绪承诺与实现脱钩 / 不就绪也报成功 / 部署脚本删数据卷 | 12/12 全红 |
 
 **后三组守的不是业务代码，而是判据本身** —— 一个量不出东西的尺子，
 和一个量出「一切正常」的尺子长得一模一样。`stream_probe` 那把尤其值得守：
@@ -349,6 +369,25 @@ python tests/e2e/reverse_check.py nginx            # 只跑一组
 这条断言本来就 flaky，绿是它的常态。所以 `tests/test_container_smoke_script.py`
 抽出脚本原文 + stub 掉 `docker` 命令，用三种确定性场景证明等待逻辑成立：
 晚到会等、始终缺失会失败、`inspect` 拿到空状态时不能把「什么都没读到」当成「安全」。
+
+新的一组 `deploy_script`（第六组）守的是**上机第一步那个脚本**，性质和上面这条一样：
+`deploy.sh` 长期处于「谁也没执行过」的状态 —— CI 直接跑 `container_smoke.sh`，
+静态校验（`tests/test_deploy_manifest.py`）只把它当**文本**读（查行尾、查字符串）。
+第一次真跑（替身 `docker`）就抓到一个静态校验永远看不见的洞：`.env` 里少一行
+`MYSQL_ROOT_PASSWORD=` 时，脚本**连一句输出都没有**就退出（`set -e` + `pipefail`）。
+现在它被两处钉住：`tests/test_deploy_script.py`（替身 `docker`，秒级走完每条分支）
+与 `container_smoke.sh` 第 5 步（在真 Docker 上真跑同一条命令）。
+于是服务器上那条 `bash deploy.sh && bash .github/scripts/container_smoke.sh`
+和 CI 里跑的**已经是同一件事**。
+
+> 这一组的第一版还犯了个值得记下来的错：**锚点打错了位置**。
+> 原以为把 `read_env` 里那句 `|| true` 拆掉就能重现「静默退出」，种回去之后测试却没红 ——
+> 那条用例等于没被验证过。量下来才发现：**`set -e` 不会中止命令替换的子壳**
+> （`echo "$(false; echo INSIDE)"` 会打印 INSIDE 并继续；Linux bash 5.2.37 与
+> Cygwin bash 5.3.15 结论一致），子壳的退出码只看它最后一条命令；而那个函数以 `printf`
+> 收尾，于是失败被**转成了空串**，由调用方那句 `[[ -n "$PW" ]] || die` 兜住。
+> 所以锚点必须打在**调用点**。顺带得到一个结论：
+> **「静默退出」和「变成空串」是两种坏法，兜住它们的是不同的东西。**
 
 三条设计上的硬要求，都写在脚本头部注释里：
 

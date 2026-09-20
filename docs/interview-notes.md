@@ -3,7 +3,8 @@
 这份文档不是「知识点罗列」，而是**每个问题配一条我在这台机器上真跑出来的数字**。
 面试官问「你怎么知道」，答案是「我测过，数字是这些」。
 
-运行环境：本机 MySQL 8.0（Windows）、Python 3.12、无 Docker/WSL。
+运行环境：本机 MySQL 8.0（Windows）、Python 3.13（venv；CI 用 3.11）、
+Docker Desktop 4.91 / 引擎 29.8.0（2026-09-19 装上，在此之前本机没有 Docker 也没有 WSL）。
 端到端联调用的是临时库 `chatbot_api_e2e`（20 个会话 / 100 条消息）+ 一个假 Ollama
 （每 50ms 吐一行 NDJSON，协议与真 Ollama 一致），跑完即 drop，不碰练习库。
 
@@ -13,7 +14,8 @@
 
 | 验证项 | 结果 |
 |---|---|
-| 单元测试 | `Ran 208 tests ... OK`（领域 31 + HTTP 层 19 + 前端客户端 25 + 会话抽象 33 + 界面 4 + 缓存 4 + 部署清单 20 + 守卫元测试 8 + 上下文与缓存顺序 8 + 流式协议 12 + schema 快照 14 + 容器脚本守卫 6 + 流式判据 10 + 反代配置守卫 14） |
+| 单元测试 | `Ran 232 tests ... OK`（领域 31 + HTTP 层 19 + 前端客户端 25 + 会话抽象 33 + 界面 4 + 缓存 4 + 部署清单 20 + 守卫元测试 8 + 上下文与缓存顺序 8 + 流式协议 12 + schema 快照 14 + **容器脚本守卫 10** + 流式判据 10 + 反代配置守卫 14 + **部署脚本守卫 20**） |
+| 反向对照（把缺陷种回去） | `tests/e2e/reverse_check.py` 六组全红：chat_stream 7/7、schema 8/8、**container_smoke 4/4**、stream_probe 4/4、nginx 8/8、deploy_script 12/12，且每次改完按字节还原（sha256 校验） |
 | 端到端冒烟（服务端视角） | `tests/e2e/smoke.py` 27 项断言全过 |
 | 端到端冒烟（前端视角） | `tests/e2e/frontend_smoke.py` 30 项断言全过 |
 | 建表 | 用仓库里的 `python -m db.init_db` 在空库建出 **6 张表**，collation 全 `utf8mb4_0900_ai_ci` |
@@ -21,7 +23,7 @@
 | SSE 流式（服务端到客户端） | 9 个 chunk，块间隔均匀 **47ms**（服务端设定 50ms），`Content-Type: text/event-stream` |
 | SSE 流式（前端客户端读到的） | 9 个 chunk，块间隔 **[50, 51, 51, 51, 50, 51, 51, 50] ms** —— 前端侧没有二次缓冲 |
 | emoji 往返 | `表情测试 🚀😀🔥` 经 HTTP → MySQL → HTTP 无损，`@@character_set_connection = utf8mb4` |
-| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上 `docker compose up -d --build` 真跑整套，**22 项 HTTP 断言 + 4 项容器内断言全过，1 分 30 秒跑完**（run `35427086843`）。本机没有 Docker，这是唯一能真跑容器的地方，详见第 9 节 |
+| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上真跑整套（**22 项 HTTP 断言 + 4 项容器内断言，1 分 30 秒**，run `35427086843`）；**本机也跑通了**（2026-09-20，Docker Desktop）：`bash .github/scripts/container_smoke.sh` → **28 项 HTTP 断言 + 10 项 shell 级检查全过，退出码 0**，含第 9 步真 nginx 反代验收，详见第 9 节 |
 | 容器里三个依赖探针 | `checks={"database":true,"redis":true,"ollama":true}` —— 分别证明「compose 服务名解析」「`REDIS_URL` 指向服务名」「`extra_hosts`/`host-gateway`」三处配置**真的生效**，而不只是写在文件里 |
 | 忽略规则与权限真的生效 | 容器内 `ls` 确认 `/app/.env`、`/app/.git`、`/app/tests`、`/app/app.py` 都不存在；容器内 `uid=1000`（非 root）；`mysql:{"3306/tcp":null}`、`redis:{"6379/tcp":null}`、`api: HostPort 8000` |
 | 公网访问（安全组 / Nginx / HTTPS） | ❌ 未验证 —— 缺一台能跑 Docker Compose 的云主机，见最后一节 |
@@ -239,7 +241,7 @@ chunk_size=   1 | 首块 0.000s | 总 0.453s | 间隔 [0.063, 0.046, 0.047, 0.04
 
 ## 附 2：怎么防止「测试变成装饰」——给守卫做反向对照
 
-上面那些部署清单问题，我用 `tests/test_deploy_manifest.py` 静态守住（19 条断言，进 CI）。
+上面那些部署清单问题，我用 `tests/test_deploy_manifest.py` 静态守住（20 条断言，进 CI）。
 但这里有个更隐蔽的风险：**断言写松了、或者写成恒真条件，它照样全绿，问题照旧上线。**
 
 所以再加一层元测试 `tests/test_deploy_manifest_guards.py`：把每个要防的缺陷**种回去**，
@@ -346,14 +348,70 @@ chunk_size=   1 | 首块 0.000s | 总 0.453s | 间隔 [0.063, 0.046, 0.047, 0.04
 
 ---
 
-## 9. 本机没有 Docker，怎么证明「容器化部署真的成立」
+## 9. 本机没有 Docker 时怎么证明「容器化部署真的成立」——以及装上 Docker 之后它又暴露了什么
 
 这是这个项目此前最弱的一点，也是面试官最容易一句话问到的地方：
-**「你写了 Dockerfile 和 compose，跑过吗？」** 之前只能回答「没有，本机没 Docker 也没 WSL」。
+**「你写了 Dockerfile 和 compose，跑过吗？」** 当时只能回答「没有，本机没 Docker 也没 WSL」。
 
-本机限制绕不过去，但可以换地方跑：**GitHub 的 runner 自带 Docker**。
-于是 `.github/workflows/container-smoke.yml` 每次 push 都把整套 compose 真拉起来，
+办法是换个地方跑：**GitHub 的 runner 自带 Docker**。于是
+`.github/workflows/container-smoke.yml` 每次 push 都把整套 compose 真拉起来，
 跑 `.github/scripts/container_smoke.sh`。同一个脚本在云主机上就是**上线验收脚本**。
+
+> 2026-09-19 本机装上了 Docker Desktop（4.91 / 引擎 29.8.0 / compose v5.5.1），
+> 这条链在本机也能跑通了。本机首跑结果：`bash .github/scripts/container_smoke.sh`
+> **28 项 HTTP 断言 + 10 项 shell 级检查全过，退出码 0**，含第 9 步真 nginx 反代验收
+> （9 块跨度 0.404s，同一把尺子在反例上判成 `BUFFERED`）。
+>
+> 但「本机能跑」不是重点。重点是：**装上之后第一次真跑，暴露了三个此前没人看见的问题** ——
+> 每一个都不是「配置写错」，而是「检查本身不成立」。
+
+### 装上 Docker 之后第一次真跑暴露的问题
+
+**① `deploy.sh` 从来没被执行过。** 它是文档里的「上机第一步」，但 CI 直接跑
+`container_smoke.sh`，静态校验只把它当**文本**读。第一次真跑（替身 `docker`，
+20 条用例）就抓到：`.env` 里少一行 `MYSQL_ROOT_PASSWORD=` 时，脚本**连一句输出都没有**
+就退出（`set -e` + `pipefail` 让赋值语句直接终止脚本）。现在它在两处被钉住 ——
+`tests/test_deploy_script.py` 与 `container_smoke.sh` 第 5 步（真跑同一条命令）。
+
+**② 装依赖那一层能慢 45 倍，而「慢」和「卡住」在屏幕上长得一样。**
+同一台机器同一个 Docker，只有 PyPI 源不同：
+
+| pip 源 | 装依赖那一层 | pyarrow（50.1 MB） |
+|---|---|---|
+| 官方 PyPI | 跑了 **3.7 小时**还没完 | 2.6 小时（约 45 KB/s） |
+| 清华镜像 | **293.7 秒**（`#9 DONE 293.7s`） | **106 秒**（427.6 kB/s） |
+
+所以现在 `.env` 有 `PIP_INDEX_URL` 这个开关，而且 `deploy.sh` 会在**构建之前**提醒
+（提醒放在构建之后是没有用的：那时只能等），`container_smoke.sh` 会打印当前用的源。
+一句会骗人的提醒比没有提醒更糟 —— 第一版只读 `.env`，我 `export PIP_INDEX_URL=镜像`
+时 compose 走了镜像、它却在屏幕上说「将走官方源、可能要几小时」，所以现在取值顺序
+和 compose 一致（**shell 环境优先于 `.env`**）。
+
+**③ 假 Ollama 起来了，容器却连到了别人的 Ollama。** 这台机器上装着一个真的 Ollama
+（占 `127.0.0.1:11434`），而 **Windows 允许 `0.0.0.0:11434` 与它同时绑定**（Linux 会
+直接 `EADDRINUSE`）。于是替身正常起来、脚本打印「假 Ollama 已监听」，可容器里的
+`host.docker.internal:11434` 经 Docker Desktop 转发出去打到宿主机**回环**，
+连到的是那个真 Ollama：
+
+```
+/health          → checks={'ollama': true}      真 Ollama 答的 /api/tags
+/chat            → 404 {"error":"model 'llama3.2' not found"}   真 Ollama 没这个模型
+冒烟脚本的报告    → [FAIL] 流式返回 9 个 chunk | reply=''        看不出是"连错了服务"
+```
+
+更糟的是脚本原来那句「就绪探测」只问「端口通不通」—— 端口是通的，只是**通到别人家**。
+同一类错误在 Linux 上的表现是：替身 bind 失败，而探测被**别人**应答，脚本照样打印成功。
+修法是两条 fail-closed 检查：起替身**之前**先确认端口没被占；起完再核**指纹**
+（`/api/tags` 里那条只有替身会返回的记录），并且**在容器里再验一次**
+（容器走的路径和宿主机不同）。加上这两条之后，同样的情况下冒烟脚本早停在一条能照着修的报错上。
+
+> 顺带一个纯粹属于开发机的坑，但值得记：装 WSL 之后 `C:\Windows\System32\bash.exe`
+> 出现了，而 Windows 的 CreateProcess 搜索顺序把 System32 排在 PATH **之前** ——
+> 于是 `subprocess.run(["bash", ...])` 命中的是 WSL 转发器，而 `shutil.which("bash")`
+> 拿到的是 Git Bash。**守卫（skipIf）和被测对象用了两个不同的 bash**，
+> 3 条容器用例因此变红（报错是 `execvpe(/bin/bash) failed`）。改成两处共用同一个
+> 解析结果（传绝对路径）后恢复。这不是代码缺陷，是环境变更 —— 但它提醒的是同一件事：
+> **「拿到一个 bash」和「拿到那个 bash」不是一回事。**
 
 ### 关键认识：静态校验和真跑一遍，证明的是两件事
 

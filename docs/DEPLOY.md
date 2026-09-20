@@ -9,17 +9,19 @@
 | 做到哪一步了 | 状态 |
 |---|---|
 | 镜像与编排文件（`Dockerfile` / `docker-compose.yml`） | ✅ 已写好 |
-| 部署脚本（`deploy.sh`） | ✅ 已写好 |
+| 部署脚本（`deploy.sh`） | ✅ 已写好，而且**被真跑过**：20 条替身 `docker` 用例走完它的每条分支（`tests/test_deploy_script.py`，进 CI），CI 的第 5 步还会用真 Docker 跑**同一条命令** |
 | 编排文件之间的自洽性（compose / Dockerfile / `.dockerignore` / `.env` 模板 / nginx 模板） | ✅ 静态校验守着：`tests/test_deploy_manifest.py`（20 用例）+ `tests/test_nginx_config.py`（14 用例）+ 证明这些守卫真会失败（8 用例），都在 CI 里 |
 | 本机跑通整个后端（真 MySQL + 假 Ollama + 真 uvicorn，27 项断言） | ✅ 已验证 |
-| **在真实 Docker 里把整套 compose 跑起来** | ✅ **CI 每次 push 真跑**：`.github/workflows/container-smoke.yml`。本机没 Docker，就用 GitHub runner 自带的 Docker——镜像能构建、容器之间能互通、容器内 MySQL 的表真是 utf8mb4、密码没被拷进镜像、3306/6379 没暴露 |
+| **在真实 Docker 里把整套 compose 跑起来** | ✅ **CI 每次 push 真跑**（`.github/workflows/container-smoke.yml`）；**2026-09-20 起本机也能真跑**（装上了 Docker Desktop）。镜像能构建、容器之间能互通、容器内 MySQL 的表真是 utf8mb4、密码没被拷进镜像、3306/6379 没暴露 |
 | **反代这一层（Nginx + 流式不被攒批）** | ✅ **配置在仓库里，并且用真 nginx 跑过**：`deploy/nginx/templates/`，验收是 `.github/scripts/container_smoke.sh` 第 9 步（`tests/e2e/nginx_check.py`），带一个**必须被判成攒批的反例**。仍然没验的只剩「真实域名 + 证书」那一层，见 §6.2 |
 | **在云主机上对公网提供服务** | ❌ **还没做过** —— 缺一台能跑 Docker Compose 的 Linux 主机 |
 
-最下面那行仍然是唯一没做到的：**还没有一台云主机**。上面的每一行都是这两轮补的，
+最下面那行仍然是唯一没做到的：**还没有一台云主机**。上面的每一行都是这几轮补的，
 补的都是同一个东西：**「文件写好了」和「真跑起来是对的」是两件事**。
-本机没有 WSL、内存 1G，跑不动 Docker，所以「容器」和「反代」这两层的真实验证一直缺位。
-补法分三层，前两层管容器，第三层管反代：
+在此之前「容器」和「反代」这两层的真实验证一直缺位，是拿 CI 的 runner 兜的
+（开发机没有 WSL、内存 1G）；2026-09-19 装上 Docker Desktop 之后，这两层在本机也能验了。
+但重点不是「本机能验」—— 是**先把「这个脚本从没被执行过」当成缺陷处理掉**，
+本机 Docker 只是让这件事更容易。补法分三层，前两层管容器，第三层管反代：
 
 1. **静态校验**（`tests/test_deploy_manifest.py` + `tests/test_nginx_config.py`，
    不需要 Docker，秒级）：凡是「只会在上云第一小时暴露」的配置问题，尽量挪到提交前。
@@ -62,11 +64,19 @@ cd ollama-streamlit-chatbot
 # ③ 填配置 + 一键部署
 cp .env.prod.example .env
 vi .env                            # 至少填 MYSQL_ROOT_PASSWORD（openssl rand -hex 24）
+                                   # 国内主机再填 PIP_INDEX_URL，见下
 bash deploy.sh
 
 # ④ 验收：把整套容器逐项断言一遍（和 CI 里跑的是同一个脚本）
 bash .github/scripts/container_smoke.sh
 ```
+
+**③ 里那行 `PIP_INDEX_URL` 值得单独说一句**，因为它是「几分钟」和「几小时」的差别：
+装依赖是构建里最慢的一层，而快慢几乎完全取决于 PyPI 通不通。本机实测（国内网络，
+同一台机器同一个 Docker）：官方 PyPI 约 **45 KB/s**，那一层跑了 **3.7 小时**还没完
+（pyarrow 一个包 2.6 小时）；换成镜像后同一个包 **106 秒**（427 KB/s），整层几分钟结束。
+`deploy.sh` 会在**开始构建之前**提醒一次（这样你还能 Ctrl-C 去改 `.env`），
+`container_smoke.sh` 也会打印当前用的是哪个源。
 
 第 ⓪ 步的用处：把「只会在上云第一小时才暴露」的那类问题（`.env` 被拷进镜像、
 `host.docker.internal` 在 Linux 上不解析、`.env` 里改了参数却没透传…）提前拦在本地。
@@ -86,9 +96,18 @@ bash .github/scripts/container_smoke.sh
 > **且带 `-v`**。你刚跑完 `deploy.sh` 再跑它，它检测到服务已在运行，就只做断言、
 > 不动你的服务，**不会删数据卷**。CI 里则是从头拉起、跑完清干净。
 
-`deploy.sh` 会依次做：前置检查（docker / compose / .env / 密码强度）→ `git pull`
+`deploy.sh` 会依次做：前置检查（docker / compose / `.env` / 密码强度 / 启用 `--proxy`
+时还要 `API_BIND=127.0.0.1`）→ 提醒构建会走哪个 pip 源 → `git pull`（`--no-pull` 跳过）
 → `docker compose up -d --build` → 轮询 `/health/ready` 最多 180 秒 → 打印依赖状态
 和验证命令。任何一步失败都会打印**能直接照抄的排查命令**。
+
+> 这个脚本长期处于「谁也没执行过」的状态 —— CI 直接跑 `container_smoke.sh`，
+> 静态校验只把它当**文本**读（查行尾、查字符串）。第一次真跑（替身 `docker`）
+> 就抓到一个静态校验永远看不见的洞：`.env` 里少一行 `MYSQL_ROOT_PASSWORD=` 时，
+> 它**连一句输出都没有**就退出（`set -e` + `pipefail`；同一段里 `API_PORT` 那处
+> 写了 `|| true`，所以只有密码这处会静默退出）。
+> 现在它被两处钉着：`tests/test_deploy_script.py`（20 条，走完它的每条分支）
+> 和 `container_smoke.sh` 第 5 步（真 Docker 上跑**同一条命令**）。
 
 ## 3. 怎么算部署成功
 
@@ -250,6 +269,8 @@ python tests/e2e/public_check.py --url https://your-domain.com
 | `docker compose` 报 unknown command | 装的是老的 `docker-compose`（带横线）。装 compose 插件，或用 `docker-compose` 命令 |
 | `permission denied ... docker.sock` | 用户不在 docker 组。`sudo usermod -aG docker $USER` 后**重新登录**（只重开终端没用） |
 | build 到一半 `Killed` | 内存不够（1G 的机器常见）。加 swap 或换 2G 机型：`fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile` |
+| **build 卡在装依赖那一层很久**（几十分钟到几小时，没有报错） | 几乎一定是 PyPI 通道问题，不是代码问题。本机实测国内网络下官方源只有 ~45 KB/s，那一层跑了 3.7 小时；换镜像后同一层几分钟。改法：`.env` 里加一行 `PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` 再重跑（已完成的层会被缓存复用）。`deploy.sh` 会在构建前提醒，`container_smoke.sh` 会打印当前用的源 |
+| `deploy.sh --proxy` 直接拒绝，说 `API_BIND` 不是 `127.0.0.1` | 这是**故意**的，不是 bug：起了反代却让 api 绑 `0.0.0.0`，外面就能绕过反代直连 8000（HTTPS / 限流 / SSE 防缓冲那一层全白配）。按提示把 `.env` 里的 `API_BIND` 改成 `127.0.0.1` 再重跑。只想直连 8000 调试就别加 `--proxy` |
 | api 一直重启，日志 `Can't connect to MySQL` | 看 `docker compose logs mysql` 是不是初始化失败；`depends_on: service_healthy` 只保证「健康后再起 api」，若 mysql 自己起不来就要先修 mysql |
 | `/health` 里 `redis: false` | compose 里 api 的 `REDIS_URL` 必须用服务名 `redis`，不能用 127.0.0.1 |
 | `.sh` 报 `bad interpreter: /bin/bash^M` | 文件被转成了 CRLF。仓库里 `.gitattributes` 已声明 `*.sh text eol=lf`，若仍出问题，`sed -i 's/\r$//' deploy.sh` |
