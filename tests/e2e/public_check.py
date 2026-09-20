@@ -18,6 +18,13 @@
     python tests/e2e/public_check.py --url http://1.2.3.4:8000 --no-ports
     python tests/e2e/public_check.py --url http://127.0.0.1:8100   # 经攒批替身 —— 应当红
 
+https 自签证书的场景（还没域名、或本地把这一层验一遍时）：
+
+    python tests/e2e/public_check.py --url https://127.0.0.1:8443 --ca /tmp/self/cert.pem --no-ports
+
+`--ca` 只是把信任根换成那一张，证书校验**仍然开着**；`--insecure` 才会关掉校验，
+只允许本机对自签证书量流式时用（它会打印告警）。
+
 退出码：0 全部通过；1 有失败项；2 连不上目标。
 """
 
@@ -130,6 +137,10 @@ def main() -> int:
                     help="端口探针的控制组端口（默认取 --url 的端口）。"
                          "本地自测时可故意指一个关着的端口，用来验证「探针自检」真的会拦住假绿")
     ap.add_argument("--no-ports", action="store_true", help="跳过端口检查（本地自测时用）")
+    ap.add_argument("--ca", default=None,
+                    help="https 时改用这份证书作为信任根（本地自签验收用；校验仍然开着）")
+    ap.add_argument("--insecure", action="store_true",
+                    help="https 时不校验证书。**只允许**本机对自签证书量流式用")
     ap.add_argument("--timeout", type=float, default=30.0)
     args = ap.parse_args()
 
@@ -140,6 +151,14 @@ def main() -> int:
     port = parsed.port or (443 if use_tls else 80)
 
     print(f"验收目标：{base}   (host={host} port={port} tls={use_tls})")
+    if use_tls:
+        if args.insecure:
+            print("证书校验：**关掉了**（--insecure）—— 只量「流式还活着」，"
+                  "不再能证明对面是谁")
+        elif args.ca:
+            print(f"证书校验：开（信任根换成 {args.ca}）")
+        else:
+            print("证书校验：开（系统信任链）")
     print()
 
     s = requests.Session()
@@ -192,7 +211,8 @@ def main() -> int:
     print()
     print("── 流式检查（经反代之后，回复还是「逐块到达」吗）──")
     headers, events, total = read_sse(host, port, {"conversation_id": conv_id, "content": PROMPT},
-                                      use_tls=use_tls, timeout=args.timeout)
+                                      use_tls=use_tls, ca_file=args.ca,
+                                      insecure=args.insecure, timeout=args.timeout)
 
     ct = next((l for l in headers.split("\r\n") if l.lower().startswith("content-type")), "?")
     check("Content-Type 是 text/event-stream", "text/event-stream" in headers.lower(), ct)

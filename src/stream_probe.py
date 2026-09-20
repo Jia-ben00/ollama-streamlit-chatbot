@@ -44,6 +44,8 @@ def read_sse(
     *,
     path: str = "/chat",
     use_tls: bool = False,
+    ca_file: Optional[str] = None,
+    insecure: bool = False,
     timeout: float = 30.0,
     recv_size: int = 4096,
     extra_headers: Optional[Sequence[str]] = None,
@@ -55,6 +57,16 @@ def read_sse(
 
     到达时刻是相对请求发出那一刻的秒数（单调时钟，不受系统时间调整影响），
     同一个事件块里的多个 `data:` 行共用块内首字节的到达时刻。
+
+    证书（只有 `use_tls=True` 时相关）：
+    - 默认按系统信任链校验 —— `https://<真实域名>` 就走这条；
+    - `ca_file=<路径>`：只信这一张（`create_default_context` 在给了 cafile 时**不会**
+      再加载系统根证书，正好是自签验收要的语义：那张证书是唯一可信的根）。
+      **校验仍然开着**，只是换了一条信任链 —— 这是本地验 TLS 的推荐姿势；
+    - `insecure=True`：彻底关掉校验。那等于放弃「对面是谁」这件事，
+      只配用来在本机对自签证书量流式，别用在任何真实环境（public_check 会告警）。
+    后两个参数存在的原因很实在：没有它们，`use_tls` 这条分支永远没法在本机执行 ——
+    而「从没执行过的代码」正是本项目栽过最多的那类洞。
     """
     body = json.dumps(payload).encode("utf-8")
     host_header = host if port in (80, 443) else f"{host}:{port}"
@@ -72,8 +84,20 @@ def read_sse(
 
     raw = socket.create_connection((host, port), timeout=timeout)
     if use_tls:
-        ctx = ssl.create_default_context()
-        raw = ctx.wrap_socket(raw, server_hostname=host)
+        ctx = ssl.create_default_context(cafile=ca_file)
+        if insecure:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        try:
+            # server_hostname 传 host：给了 cafile 时证书里的名字也要对上，
+            # 所以自签证书得把 127.0.0.1 写进 SAN（IP:127.0.0.1），否则照样验不过。
+            raw = ctx.wrap_socket(raw, server_hostname=host)
+        except Exception:
+            # 握手失败（最典型的就是证书验不过）时把底层 socket 收掉：
+            # 「验签必须失败」本身是一条**要断言的**行为（tests/e2e/nginx_check.py 的 C 段
+            # 用默认信任链去打自签证书），每次跑都泄一个 fd 就不好了。
+            raw.close()
+            raise
     raw.sendall(head + body)
 
     try:

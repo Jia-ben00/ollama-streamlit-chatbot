@@ -34,7 +34,7 @@ GITATTRIBUTES = REPO / ".gitattributes"
 # 两者天然不撞名。哪天有人写了 ${host}，nginx 渲染出来的 Host 头会变成环境变量的值。
 PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-EXPECTED_PLACEHOLDERS = {"SERVER_NAME", "API_UPSTREAM", "LISTEN_PORT"}
+EXPECTED_PLACEHOLDERS = {"SERVER_NAME", "API_UPSTREAM", "LISTEN_PORT", "LISTEN_TLS_PORT"}
 
 
 def read(path: Path) -> str:
@@ -95,10 +95,19 @@ class TestTemplateIsRenderable(NginxConfigBase):
         )
 
     def test_placeholder_set_is_exactly_what_compose_provides(self):
-        """多一个少一个都要红：少了渲染出空值，多了说明 compose 没传（渲染成空）。"""
+        """多一个少一个都要红：少了渲染出空值，多了说明 compose 没传（渲染成空）。
+
+        比的是**两份模板占位符的并集**（明文 + deploy/nginx/tls 那份 HTTPS）：
+        单看明文这一份只是并集的子集 —— 它本来就不该知道 HTTPS 的监听端口。
+        （HTTPS 那份自己的占位符集合，由 tests/test_nginx_tls.py 单独钉死。）
+        """
+        union = set(placeholders(self.config))
+        tls = REPO / "deploy" / "nginx" / "tls" / "default.conf.template"
+        if tls.exists():
+            union |= placeholders(strip_comments(read(tls)))
         self.assertEqual(
-            placeholders(self.config), EXPECTED_PLACEHOLDERS,
-            f"模板占位符与预期不符（实际 {sorted(placeholders(self.config))}）",
+            union, EXPECTED_PLACEHOLDERS,
+            f"模板占位符与预期不符（实际 {sorted(union)}）",
         )
 
     def test_every_placeholder_resolves_with_compose_env(self):
