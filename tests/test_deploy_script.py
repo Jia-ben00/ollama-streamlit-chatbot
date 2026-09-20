@@ -454,6 +454,31 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn("不要", p.output)
         self.assertIn("8000", p.output)
 
+    def test_printed_stop_command_carries_the_profile(self):
+        """收尾打印的「停止服务」必须带 `--profile proxy`。
+
+        实测（2026-09-20，docker compose v5.5.1 / Docker Desktop）：用 `--proxy`
+        起来之后执行**不带 profile** 的 `docker compose down`，api / mysql / redis
+        都被删了，但 **proxy 还在跑、还占着 80/443**，紧接着
+        `Network chatbot_default Resource is still in use` —— 网络也删不掉。
+        下一次 `up` 直接端口冲突。这条只有真的启动过 proxy 才看得见。
+        """
+        self.write_env("MYSQL_ROOT_PASSWORD=abc123def456\nAPI_BIND=127.0.0.1\n"
+                       "PROXY_HTTP_PORT=80\n")
+        p = self.run_deploy("--proxy")
+        self.assertEqual(p.returncode, 0, p.output)
+        self.assertIn("docker compose --profile proxy down", p.output)
+        self.assertIn("docker compose --profile proxy down -v", p.output)
+        # 不带 profile 的那条**不能**出现：它就是上文那个坑。
+        self.assertNotIn("停止服务： docker compose down", p.output)
+
+    def test_printed_stop_command_has_no_profile_without_the_proxy(self):
+        self.write_env(GOOD_ENV)
+        p = self.run_deploy()
+        self.assertEqual(p.returncode, 0, p.output)
+        self.assertIn("停止服务： docker compose down", p.output)
+        self.assertNotIn("--profile proxy", p.output)
+
     # ── HTTPS（TLS 模式的识别 + 证书前置检查）────────────────────────────
     def _templates_tree(self, *, tls=True, certs=("fullchain.pem", "privkey.pem")):
         """造出 deploy.sh 会去看的那几样东西（都用**相对路径**）。

@@ -288,14 +288,23 @@ if [[ "$TLS_MODE" == "1" ]]; then
          证书是签给域名的，所以这里默认用域名跑，别用 IP。）"
 fi
 
+# 打印的「停止服务」必须与部署形态一致。
+# `docker compose down` **不会**停掉属于非激活 profile 的服务：用 --proxy 部署时，
+# 反代容器会原地留着、继续占着 80/443，连网络都删不掉（实测报
+# `Resource is still in use`），下一次 up 就会端口冲突。所以这里按形态给对的那条命令。
+COMPOSE_SVC="docker compose"
+if [[ "$WITH_PROXY" == "1" ]]; then
+  COMPOSE_SVC="docker compose --profile proxy"
+fi
+
 cat <<EOF
 
   本机验证： curl -s${CURL_EXTRA} ${SCHEME}://127.0.0.1:${HOST_PORT}/health | python -m json.tool
   公网验证： curl -s${CURL_EXTRA} ${SCHEME}://${IP}:${HOST_PORT}/health | python -m json.tool
   API 文档： ${SCHEME}://${IP}:${HOST_PORT}/docs
   实时日志： docker compose logs -f api
-  停止服务： docker compose down          （保留数据）
-  清库重来： docker compose down -v       （会删 mysql 数据卷）
+  停止服务： ${COMPOSE_SVC} down          （保留数据）
+  清库重来： ${COMPOSE_SVC} down -v       （会删 mysql 数据卷）
 
 ${ENTRY_NOTE}
 ${SG_NOTE}

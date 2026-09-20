@@ -14,7 +14,7 @@
 | `container_smoke` | `.github/scripts/container_smoke.sh` 的端口断言等待逻辑 | `tests/test_container_smoke_script.py` |
 | `stream_probe` | `src/stream_probe.py` 的「流式有没有退化成攒批」判据 | `tests/test_stream_probe.py` |
 | `nginx` | 明文模板 `deploy/nginx/templates/` + HTTPS 模板 `deploy/nginx/tls/` + compose 接线 + `.gitattributes`（关缓冲 / HTTP1.1 / Connection 置空 / 超时 / 上游用服务名 / 占位符全大写 / 模板真挂上 / SSL 监听 / 明文跳转 / 证书路径 / TLS 下限 / **两份模板不漂移** / 配置源可切换 / 证书只读挂载 / 探针两种模式都能用） | `tests/test_nginx_config.py`、`tests/test_nginx_tls.py` |
-| `deploy_script` | `deploy.sh` 的每一条前置检查与分支（没装 docker / 无 compose 插件 / 守护进程不可用 / 缺 .env / 密码缺失或不合格 / 参数打错 / `--proxy` 与 API_BIND / `--no-pull` / 轮询上限 / **TLS 模式下的证书与配置源检查**） | `tests/test_deploy_script.py` |
+| `deploy_script` | `deploy.sh` 的每一条前置检查与分支（没装 docker / 无 compose 插件 / 守护进程不可用 / 缺 .env / 密码缺失或不合格 / 参数打错 / `--proxy` 与 API_BIND / `--no-pull` / 轮询上限 / **TLS 模式下的证书与配置源检查** / **收尾打印的 down 要带 `--profile proxy`**） | `tests/test_deploy_script.py` |
 
 HTTPS 那一半是后补的。在它之前，TLS 是本项目**唯一整层没验过**的地方，理由写的是
 「ACME 签发要有域名」—— 而那个理由只覆盖**签发**那一半：「TLS 之后流式还活着吗」
@@ -213,6 +213,14 @@ READY_PROMISE = r'''log "等待 API 就绪（轮询 http://127.0.0.1:8000/health
 READY_PROMISE_FIXED = r'''log "等待 API 就绪（轮询 http://127.0.0.1:8000/health/ready，最多 180 秒）"'''
 READY_GUARD = r'''if [[ "$READY" != "1" ]]; then'''
 DEPLOY_DONE = r'''log "部署完成"'''
+
+# ⑮ 收尾打印的「停止服务」不带 profile（2026-09-20 真跑抓到的）。
+#    用户照着这行敲下去，proxy 容器会原地留着、继续占着 80/443，网络也删不掉
+#    （`Resource is still in use`），下一次 up 直接端口冲突。
+#    它与 ⑨ 是同一件事的两端 —— ⑨ 是「起的时候忘了 profile」，这里是「停的时候忘了」；
+#    起对了、停错了，一样会把人卡住，而且是在他最想不到的时候（「我就想停掉重来」）。
+COMPOSE_SVC_LINE = r'''  COMPOSE_SVC="docker compose --profile proxy"'''
+COMPOSE_SVC_LINE_BARE = r'''  COMPOSE_SVC="docker compose"'''
 
 GROUPS = {
     "chat_stream": [
@@ -429,6 +437,12 @@ GROUPS = {
         ("配置源目录不存在不拦", DS,
          '[[ -d "$TEMPLATES_DIR" ]] || die', 'true || die',
          TDS + ".DeployScriptTest.test_missing_templates_dir_is_refused"),
+        # ⑮ 收尾打印的「停止服务」忘了 profile —— 与 ⑨ 是一件事的两端。
+        #    ⑨ 是「起的时候忘了」（入口根本不在反代上），这里是「停的时候忘了」：
+        #    照它敲下去，proxy 原地留着、继续占 80/443、网络删不掉，下次 up 端口冲突。
+        #    这条是**第 10 步第一次真跑**才暴露出来的（proxy 就是这么活下来的）。
+        ("收尾提示的 down 不带 profile", DS, COMPOSE_SVC_LINE, COMPOSE_SVC_LINE_BARE,
+         TDS + ".DeployScriptTest.test_printed_stop_command_carries_the_profile"),
     ],
 }
 
