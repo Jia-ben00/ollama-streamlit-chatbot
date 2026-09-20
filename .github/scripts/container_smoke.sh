@@ -10,20 +10,22 @@
 #
 # GitHub 的 runner 自带 Docker，于是把这件事放到 CI 里做：每次 push 都真跑一遍。
 # 同一个脚本在云主机上也能跑 —— 那就是**上线验收脚本**：
-#   bash deploy.sh && bash .github/scripts/container_smoke.sh
+#   bash deploy.sh --proxy && bash .github/scripts/container_smoke.sh
 #
 # 用法
 # ----
 #   bash .github/scripts/container_smoke.sh              # 全自动：准备 .env、起假 Ollama、跑完清理
 #   KEEP=1 bash .github/scripts/container_smoke.sh       # 失败时保留容器，便于进去排查
 #   PYTHON=python3 bash .github/scripts/container_smoke.sh
-#   WITH_PROXY=0 bash .github/scripts/container_smoke.sh # 跳过「经真 nginx 的反代验收」
+#   WITH_PROXY=0 bash .github/scripts/container_smoke.sh # 跳过「经真 nginx 的反代验收」（第 9 步）
+#   WITH_PROXY_DEPLOY=0 bash .github/scripts/container_smoke.sh   # 跳过第 10 步（deploy.sh --proxy 真跑）
 #
 # 收尾的规矩（重要，涉及数据安全）
 # -------------------------------
 # 只有「服务是本次运行自己拉起来的」才会 `docker compose down -v` 清干净（CI 需要）。
 # 如果启动前服务已经在跑——典型场景是刚在云主机上 `deploy.sh` 完，拿本脚本做验收——
 # 就只做断言、结束时不动服务，**不会删数据卷**。因为 `down -v` 会删掉 mysql_data。
+# 同一条门控也管着第 10 步：那一步会改 .env 并重建 api 容器，在别人的服务上不能做。
 #
 # 它会做什么
 # ----------
@@ -36,9 +38,13 @@
 #   7. 等就绪 + 灌种子数据（必须 exec 进容器，因为 MySQL 刻意没对宿主机开端口）
 #   8. 从宿主机打发布端口跑端到端断言（tests/e2e/container_smoke.py）
 #   9. 起真 nginx 容器（用仓库里那份模板）接在 api 前面，量 SSE 的到达时刻，
-#      并用一个「必须被判成攒批」的反例证明这把尺子在这里量得出东西
+#      并用「必须被判成攒批」的反例证明这把尺子在这里量得出东西 ——
+#      明文与 HTTPS 两条通道各一套，共五段
 #      （tests/e2e/nginx_check.py；WITH_PROXY=0 可跳过）
-#  10. 失败时打印容器日志与状态，然后按上面的规矩收尾
+#  10. 用真正的 `deploy.sh --proxy` 把 compose 里那个 proxy 服务拉起来（HTTPS 形态），
+#      从宿主机验收整个入口：healthcheck、301 跳转、public_check.py --ca
+#      （tests/e2e/proxy_deploy_check.py；服务不是本次拉起的就跳过）
+#  11. 失败时打印容器日志与状态，然后按上面的规矩收尾
 #
 # 一个反复出现的写法约定（本脚本里刻意保持）：**所有检查都 fail-closed**。
 # 不要写 `X="$(cmd | tail -1)"; [[ "$X" != "bad" ]]` 这种形式 ——
@@ -69,6 +75,13 @@ PRE_EXISTING=0
 # 所以这里不会去动 80 端口，也不会改变 compose 的形态。
 WITH_PROXY="${WITH_PROXY:-1}"
 
+# 第 10 步「用 deploy.sh --proxy 真起一次反代（HTTPS 形态）」是否要跑。
+# 与第 9 步的区别：第 9 步验的是「模板 + compose 接线」在真 nginx 上成不成立
+# （它起自己的容器，不碰 compose 的 proxy 服务）；第 10 步验的是**云主机上第一条命令**
+# 整条路径成不成立。它会改 .env 并重建 api 容器，所以在别人的部署上必须跳过 ——
+# 那道门控是 PRE_EXISTING（见下），不是这个变量。
+WITH_PROXY_DEPLOY="${WITH_PROXY_DEPLOY:-1}"
+
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
 warn() { printf '\033[1;33m[WARN] %s\033[0m\n' "$1"; }
 die()  { printf '\n\033[1;31m[FAIL] %s\033[0m\n' "$1" >&2; exit 1; }
@@ -96,7 +109,12 @@ cleanup() {
   if [[ "$PRE_EXISTING" == "1" ]]; then
     warn "服务在本次运行前就已经在跑，跳过 down（不会动你的数据卷）"
   else
-    docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+    # **必须带 `--profile proxy`**：不带的话 `proxy` 属于「非激活 profile」，
+    # `down` 根本不会去停它 —— 结果是反代容器继续占着 80/443，而且
+    # `Network chatbot_default Resource is still in use`，网络也删不掉，
+    # 下一次 up 直接端口冲突。实测（2026-09-20）：不带 profile 的 down 之后
+    # `chatbot-proxy-1` 仍在跑、仍占 80/443。
+    docker compose --profile proxy down -v --remove-orphans >/dev/null 2>&1 || true
   fi
   [[ -n "$FAKE_PID" ]] && kill "$FAKE_PID" 2>/dev/null || true
   return $rc
@@ -104,7 +122,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── 1. 前置检查 ────────────────────────────────────────
-log "1/9 前置检查"
+log "1/10 前置检查"
 command -v docker >/dev/null 2>&1 || die "没有 docker。安装：curl -fsSL https://get.docker.com | sh"
 docker info >/dev/null 2>&1 || die "docker 守护进程不可用（或当前用户不在 docker 组）"
 docker compose version >/dev/null 2>&1 || die "缺少 docker compose 插件（要 docker compose，不是 docker-compose）"
@@ -115,7 +133,7 @@ echo "  compose: $(docker compose version --short 2>/dev/null || echo '?')"
 echo "  python:  $("$PYTHON" --version 2>&1)"
 
 # ── 2. 准备 .env ───────────────────────────────────────
-log "2/9 准备 .env"
+log "2/10 准备 .env"
 if [[ ! -f .env ]]; then
   cp .env.prod.example .env
   echo "  已从 .env.prod.example 生成 .env"
@@ -147,7 +165,7 @@ if grep -qE '^MYSQL_ROOT_PASSWORD=.*@' .env; then
 fi
 
 # ── 3. 校验 compose 配置 ───────────────────────────────
-log "3/9 校验 compose 配置（语法 + 变量插值）"
+log "3/10 校验 compose 配置（语法 + 变量插值）"
 docker compose config >/dev/null || die "docker compose config 失败（YAML 语法或变量插值有问题）"
 docker compose config | grep -q 'host-gateway' \
   || die "compose 里没有 extra_hosts: host-gateway，容器将无法解析 host.docker.internal"
@@ -186,7 +204,7 @@ if [[ -n "$(docker compose ps -q 2>/dev/null)" ]]; then
 fi
 
 # ── 4. 起假 Ollama ─────────────────────────────────────
-log "4/9 启动假 Ollama（绑 0.0.0.0:${FAKE_PORT}）"
+log "4/10 启动假 Ollama（绑 0.0.0.0:${FAKE_PORT}）"
 
 # 先确认这个端口**没有别人占着**，再起替身。这是一个 fail-closed 的前置检查，
 # 因为「端口能连上」和「连到的是我们的替身」是两件事：
@@ -268,13 +286,13 @@ ok "假 Ollama 在 0.0.0.0:${FAKE_PORT} 监听（pid=${FAKE_PID}，指纹已核�
 # 不加 `--proxy`：反代的验收在第 9 步自己做（它会起自己的 nginx 容器，
 # 不需要 compose 里那个 proxy 服务，也就不会去占 80 端口）。
 # deploy.sh 自己会轮询 /health/ready（第 7 步再做一次，那时已经是秒过）。
-log "5/9 构建镜像并启动（真跑 deploy.sh --no-pull）"
+log "5/10 构建镜像并启动（真跑 deploy.sh --no-pull）"
 bash deploy.sh --no-pull
 docker compose ps
 
 # ── 6. 容器内断言 ──────────────────────────────────────
 # 这些只能用 docker CLI 看，HTTP 层看不见，所以放在编排脚本而不是 python 断言里。
-log "6/9 容器内断言"
+log "6/10 容器内断言"
 
 # ① 凭据没有进镜像：.dockerignore 是否真的生效。
 #    注意这条和静态校验的区别：静态校验证明「.dockerignore 里写了 .env」，
@@ -368,7 +386,7 @@ else:
 ok "容器确实连到假 Ollama（host.docker.internal:${FAKE_PORT}，指纹一致）"
 
 # ── 7. 等就绪 + 灌种子数据 ─────────────────────────────
-log "7/9 等 API 就绪"
+log "7/10 等 API 就绪"
 API_PORT_EFFECTIVE="$(grep -E '^API_PORT=' .env | head -1 | cut -d= -f2- || true)"
 API_PORT_EFFECTIVE="${API_PORT_EFFECTIVE:-8000}"
 
@@ -412,7 +430,7 @@ finally:
 PY
 
 # ── 8. 端到端断言 ──────────────────────────────────────
-log "8/9 从宿主机打发布端口，跑端到端断言"
+log "8/10 从宿主机打发布端口，跑端到端断言"
 set +e
 API_BASE="http://127.0.0.1:${API_PORT_EFFECTIVE}" "$PYTHON" tests/e2e/container_smoke.py
 RC=$?
@@ -439,7 +457,7 @@ fi
 # 需要宿主上有 openssl 来签那张自签证书（镜像里没有；Linux/macOS 自带，
 # Windows 装了 Git 就有）。找不到会**响亮地失败**，不会静默跳过。
 if [[ "$WITH_PROXY" == "1" ]]; then
-  log "9/9 经真 nginx 的反代验收（量到达时刻，不看配置文本）"
+  log "9/10 经真 nginx 的反代验收（量到达时刻，不看配置文本）"
   set +e
   "$PYTHON" tests/e2e/nginx_check.py
   RC=$?
@@ -450,6 +468,49 @@ if [[ "$WITH_PROXY" == "1" ]]; then
   fi
 else
   warn "WITH_PROXY=0：跳过经真 nginx 的反代验收（上云前请务必单独跑一次）"
+fi
+
+# ── 10. 反代再往前一步：让 deploy.sh 真的把 compose 里那个 proxy 服务拉起来 ──
+# 第 9 步起的是 nginx_check.py **自己的**容器，它不需要 compose 的 proxy 服务
+# （第 5 步也正因此刻意没加 `--proxy`）。于是有一条路径长期没人走过：
+# **`bash deploy.sh --proxy`** —— 而它正是云主机上的第一条命令。
+# 具体没被验证过的东西：`profiles: ["proxy"]` 真的生效吗、那颗
+# 「先探明文、失败再探 HTTPS」的双模式 healthcheck 在 TLS 下真的会通过吗、
+# 明文口的 301 跟过去真的到得了 HTTPS 吗、`--proxy` 的 API_BIND 前置检查
+# 在**配置正确**时真的放行吗（替身用例验的是它拦住错的）。
+#
+# 这一步会改 .env（配置源 / 证书目录 / API_BIND）并**重建 api 容器**，
+# 所以门控是「服务是不是本次运行自己拉起来的」：在正式部署上做验收时
+# （PRE_EXISTING=1）必须跳过 —— 不能把别人正在跑的服务改掉。
+if [[ "$PRE_EXISTING" == "1" ]]; then
+  warn "10/10 跳过：服务在本次运行之前就在跑。这一步会改 .env 并重建 api 容器，"
+  warn "      在正式部署上不能做（要验它就看 CI，或另起一套再跑本脚本）。"
+elif [[ "$WITH_PROXY_DEPLOY" != "1" ]]; then
+  warn "WITH_PROXY_DEPLOY=0：跳过 10/10（deploy.sh --proxy 真跑）"
+else
+  log "10/10 真跑 deploy.sh --proxy（HTTPS 形态）并验收入口"
+  set +e
+  # 显式把**当前这个** bash 的绝对路径传给子进程：装了 WSL 之后
+  # `subprocess.run(["bash", ...])` 会命中 System32\bash.exe（WSL 转发器），
+  # 而 `shutil.which("bash")` 拿到的是 Git Bash —— 守卫与被测对象必须用同一个 bash。
+  # `$BASH` 就是正在执行本脚本的那个 shell 的绝对路径（详见
+  # tests/test_container_smoke_script.py 顶部那段注释）。
+  #
+  # 但在 Git Bash 下 `$BASH` 是 POSIX 写法（`/usr/bin/bash`），Windows 上的 Python
+  # 认不出它 —— 所以先用 cygpath 转成宿主看得懂的路径（cygpath 只有 MSYS 有，
+  # Linux/macOS 上 PATH 本来就是原生路径，不需要转）。
+  if command -v cygpath >/dev/null 2>&1; then
+    SMOKE_BASH="$(cygpath -w "${BASH:-bash}")"
+  else
+    SMOKE_BASH="${BASH:-$(command -v bash)}"
+  fi
+  SMOKE_BASH="$SMOKE_BASH" "$PYTHON" tests/e2e/proxy_deploy_check.py --owned
+  RC=$?
+  set -e
+  if [[ "$RC" -ne 0 ]]; then
+    log "deploy.sh --proxy 真跑失败（加 KEEP=1 重跑可保留现场）"
+    exit "$RC"
+  fi
 fi
 
 log "容器冒烟全部通过"
