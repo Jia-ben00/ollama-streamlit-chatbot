@@ -23,7 +23,7 @@ Docker Desktop 4.91 / 引擎 29.8.0（2026-09-19 装上，在此之前本机没�
 | SSE 流式（服务端到客户端） | 9 个 chunk，块间隔均匀 **47ms**（服务端设定 50ms），`Content-Type: text/event-stream` |
 | SSE 流式（前端客户端读到的） | 9 个 chunk，块间隔 **[50, 51, 51, 51, 50, 51, 51, 50] ms** —— 前端侧没有二次缓冲 |
 | emoji 往返 | `表情测试 🚀😀🔥` 经 HTTP → MySQL → HTTP 无损，`@@character_set_connection = utf8mb4` |
-| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上真跑整套（**22 项 HTTP 断言 + 4 项容器内断言，1 分 30 秒**，run `35427086843`）；**本机也跑通了**（2026-09-20，Docker Desktop）：`bash .github/scripts/container_smoke.sh` → **36 PASS / 0 FAIL**（8/9 端到端 22 条 + 9/9 反代 14 条：明文 A/B、HTTPS C/C′/D）+ 7 项 shell 级 ✓，退出码 0，详见第 9 节 |
+| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上真跑整套（**36 PASS / 0 FAIL，含明文 A/B 与 HTTPS C/C′/D，约 1 分 40 秒**，run `35489196611`）；**本机也跑通了**（2026-09-20，Docker Desktop）：`bash .github/scripts/container_smoke.sh` → **36 PASS / 0 FAIL**（8/9 端到端 22 条 + 9/9 反代 14 条）+ 7 项 shell 级 ✓，退出码 0，详见第 9 节 |
 | 容器里三个依赖探针 | `checks={"database":true,"redis":true,"ollama":true}` —— 分别证明「compose 服务名解析」「`REDIS_URL` 指向服务名」「`extra_hosts`/`host-gateway`」三处配置**真的生效**，而不只是写在文件里 |
 | 忽略规则与权限真的生效 | 容器内 `ls` 确认 `/app/.env`、`/app/.git`、`/app/tests`、`/app/app.py` 都不存在；容器内 `uid=1000`（非 root）；`mysql:{"3306/tcp":null}`、`redis:{"6379/tcp":null}`、`api: HostPort 8000` |
 | **HTTPS（TLS 握手 + 流式 + 尺子的反例）** | ✅ 本机验过：自签证书（SAN 含 `IP:127.0.0.1`）真起 TLS，`nginx_check.py` 的 C/C′/D 三段 —— 明文口 301 保留路径、真 TLS 下 `9 块 / 跨度 0.404s` 仍是 INCREMENTAL、默认信任链打自签证书必须 `SSLCertVerificationError`（证明证书校验真开着）、TLS 下开 buffering 必须被判 BUFFERED |
@@ -471,7 +471,7 @@ badge 的含义就从「代码是对的」变成「代码是对的、而且今�
    这条的价值不在于改了哪行代码，而在于**先测量再动手**：凭直觉改会把
    「文档推荐了一个坏命令」这个错误结论写进仓库。
 
-### 真跑出来的证据（CI run `35427086843`，1m30s）
+### 真跑出来的证据（CI run `35489196611`，1m40s）
 
 ```
 ✓ compose 配置可解析，变量插值正常，extra_hosts 已声明
@@ -486,15 +486,26 @@ badge 的含义就从「代码是对的」变成「代码是对的、而且今�
 
 [PASS] 容器能连上 MySQL 容器（compose 服务名解析） | checks={'database': True, 'redis': True, 'ollama': True}
 [PASS] 容器能连上 Redis 容器（REDIS_URL 指向服务名）
-[PASS] 容器能访问宿主机上的 Ollama（extra_hosts + host-gateway 生效）
 [PASS] /health/ready 返回 200（三依赖全通才就绪） | HTTP 200 {"status":"ready","checks":{...全 true}}
 [PASS] 流式返回 9 个 chunk（容器 -> 宿主机假 Ollama -> 容器） | reply='武汉今天多云，22 度，适合出门。'
 [PASS] 每块间隔贴合服务端节奏（容器链路没有攒批） | gaps=[0.05, 0.05, 0.051, 0.05, 0.05, 0.051, 0.05, 0.05]
-[PASS] 首块在 1 秒内到达 | 首块 0.015s / 总 0.47s
 [PASS] emoji 经「容器内 MySQL」往返无损（表字符集真的是 utf8mb4） | '表情测试 🚀😀🔥'
 ...
-全部通过   （22 PASS / 0 FAIL + 8 项 shell 级检查）
+── A：仓库配置 → api（真应用，chunked 分帧）──
+[PASS] 经真 nginx：回复仍是逐块到达的 | 9 块，跨度 0.405s
+── B（反例）：开 proxy_buffering → 裸 SSE 上游 ──
+[PASS] 反例确实被判成攒批（证明这把尺子在这里量得出东西） | 实测判定=BUFFERED
+── C：仓库的 HTTPS 配置 → 真 TLS 握手 → api ──
+[PASS] 明文入口只做跳转：3xx → https 且路径保留 | 301 → https://127.0.0.1/health
+[PASS] 经真 TLS：回复仍是逐块到达的（TLS 没有把它攒起来） | 9 块，跨度 0.402s
+[PASS] 反例：默认信任链拒绝自签证书（证明证书校验真的开着） | =SSLCertVerificationError
+── D（反例）：TLS + proxy_buffering on → 裸 SSE 上游 ──
+[PASS] 反例：TLS 下开着 proxy_buffering 仍被判成攒批（尺子在 TLS 上不瞎） | 实测判定=BUFFERED
+全部通过：明文与 HTTPS 两条路径上，流式都没有退化成攒批，且判据在两个反例上确实会红。
 ```
+
+（本机同一条命令也是 **36 PASS / 0 FAIL**；CI 上 TLS 段是 `9 块 / 0.402s`、本机是 `0.404s`，
+差在噪声里 —— 两边量出来的都是 `INCREMENTAL`。）
 
 其中三条最能证明「配置真的生效」而不只是「写在文件里」：
 
