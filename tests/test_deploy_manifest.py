@@ -283,20 +283,26 @@ class TestComposeTopology(DeployManifestBase):
         """反代是入口，发布端口是对的 —— 但不能顺手把内部端口也带出去。
 
         端口是模板化的，所以不能靠「字符串里有没有 3306」来判断：真正的约束是
-        **它只引用自己的入口端口变量**。混进 API_PORT（或别的服务端口）就等于
-        把内部端口一起开到公网，而这在 compose 里看起来完全正常。
+        **它只引用自己的那两个入口端口变量**（HTTP 与 HTTPS）。混进 API_PORT
+        （或别的服务端口）就等于把内部端口一起开到公网，而这在 compose 里看起来完全正常。
         """
         proxy = self.services.get("proxy")
         if proxy is None:
             self.skipTest("compose 里没有 proxy 服务")
         specs = [str(x) for x in (proxy.get("ports") or [])]
         self.assertTrue(specs, "proxy 没有发布端口，那它就不算入口")
+        allowed = {"PROXY_HTTP_PORT", "PROXY_HTTPS_PORT"}
         for spec in specs:
             with self.subTest(port=spec):
                 names = {m[0] for m in INTERP_RE.findall(spec)}
+                extra = sorted(names - allowed)
                 self.assertEqual(
-                    names, {"PROXY_HTTP_PORT"},
-                    f"proxy 的端口映射引用了 {sorted(names)}；只该引用 PROXY_HTTP_PORT",
+                    extra, [],
+                    f"proxy 的端口映射引用了 {extra}；只该引用 {sorted(allowed)} 里的变量",
+                )
+                self.assertEqual(
+                    len(names), 1,
+                    f"这一条映射引用了 {sorted(names)} 个变量：每条只该绑定一个入口端口",
                 )
                 for internal in ("3306", "6379"):
                     self.assertNotIn(internal, spec, f"proxy 的映射里出现了内部端口 {internal}")

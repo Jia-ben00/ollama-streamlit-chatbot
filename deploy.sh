@@ -113,10 +113,50 @@ if [[ "$WITH_PROXY" == "1" ]]; then
   fi
 fi
 
+# ── 1b2. 反代这一层是明文还是 HTTPS：**看配置，不看命名** ──────────
+#
+# 判断依据是「待渲染的那份模板里有没有 ssl_certificate」，而不是「目录名里有没有 tls」：
+# 目录名随便起，而「我到底在对外提供明文还是 TLS」只有配置能回答。
+# compose 侧的开关是 NGINX_TEMPLATES_DIR（见 docker-compose.yml 的 proxy 服务）。
+TEMPLATES_DIR="${NGINX_TEMPLATES_DIR:-$(read_env NGINX_TEMPLATES_DIR)}"
+TEMPLATES_DIR="${TEMPLATES_DIR:-./deploy/nginx/templates}"
+TLS_MODE=0
+if [[ "$WITH_PROXY" == "1" ]]; then
+  [[ -d "$TEMPLATES_DIR" ]] || die "NGINX_TEMPLATES_DIR=${TEMPLATES_DIR} 不存在。
+       反代容器会挂到一个空目录上，然后服务镜像自带的默认站点（也是 200，很难看出不对）。
+       仓库里有两份：./deploy/nginx/templates（明文）、./deploy/nginx/tls（HTTPS）。"
+  # 目录里没有 *.template 时 glob 不展开、grep 静默失败 —— 这没问题（就当不是 TLS），
+  # 上面那条目录检查已经兜住了「挂错地方」这一类。
+  if grep -qs 'ssl_certificate ' "$TEMPLATES_DIR"/*.template 2>/dev/null; then
+    TLS_MODE=1
+  fi
+fi
+HTTPS_PORT="$(read_env PROXY_HTTPS_PORT)"
+HTTPS_PORT="${HTTPS_PORT:-443}"
+
+# 证书必须在 up **之前**检查：少了证书文件，nginx 会在容器里当场退出，
+# 用户看到的却是「反代起不来 + 一串 nginx 日志」，而且要先等构建跑完才能看到。
+# 这两个名字写死在模板里（deploy/nginx/tls/default.conf.template 那两行），
+# 所以这里查的正是它接下来会去读的那两个。
+if [[ "$TLS_MODE" == "1" ]]; then
+  CERT_DIR="${TLS_CERT_DIR:-$(read_env TLS_CERT_DIR)}"
+  CERT_DIR="${CERT_DIR:-./deploy/nginx/certs}"
+  for f in fullchain.pem privkey.pem; do
+    [[ -f "${CERT_DIR}/${f}" ]] || die "配置源是 HTTPS（${TEMPLATES_DIR}），但 ${CERT_DIR} 里没有 ${f}。
+       nginx 会因此在启动时直接退出（日志里是 cannot load certificate ...）。
+       两种解法：
+         · 已有证书：让它按这两个固定名字就位（certbot 的 live/<域名>/ 正好是这两个名字），
+           再把 .env 里的 TLS_CERT_DIR 指过去；
+         · 只想先在本机把这一层验掉：python tests/e2e/nginx_check.py（自签证书，不需要域名）。"
+  done
+fi
+
 echo "  docker:   $(docker --version)"
 echo "  compose:  $(docker compose version --short 2>/dev/null || echo '?')"
 echo "  密码长度: ${#PW} 字符（不打印内容）"
-if [[ "$WITH_PROXY" == "1" ]]; then
+if [[ "$WITH_PROXY" == "1" && "$TLS_MODE" == "1" ]]; then
+  echo "  入口:     HTTPS 反代 :${HTTPS_PORT} → api:8000（明文 :${PROXY_PORT} 只做 301 跳转）"
+elif [[ "$WITH_PROXY" == "1" ]]; then
   echo "  入口:     反代 :${PROXY_PORT} → api:8000（api 只在宿主机回环上发布）"
 else
   echo "  入口:     直连 api :${PORT}（没有反代）"
@@ -213,10 +253,20 @@ fi
 log "部署完成"
 IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo '<服务器公网IP>')"
 
-if [[ "$WITH_PROXY" == "1" ]]; then
+SCHEME="http"
+if [[ "$WITH_PROXY" == "1" && "$TLS_MODE" == "1" ]]; then
+  SCHEME="https"
+  HOST_PORT="$HTTPS_PORT"
+  ENTRY_NOTE="  反代已启用（HTTPS）：证书来自 ${CERT_DIR}，外界只能经 :${HTTPS_PORT} 进来；
+  明文 :${PROXY_PORT} 只回 301 跳转（以及 ACME 挑战，证书续期靠它）。"
+  SG_NOTE="  安全组放行 ${HTTPS_PORT} 与 ${PROXY_PORT}（80 要留给跳转和证书续期），
+  「不要」放行 ${PORT}。"
+elif [[ "$WITH_PROXY" == "1" ]]; then
   HOST_PORT="$PROXY_PORT"
   ENTRY_NOTE="  反代已启用：api 只在容器内网与宿主机回环上可达，外界只能经 :${PROXY_PORT} 进来。"
-  SG_NOTE="  安全组只放行 ${PROXY_PORT}（配好 HTTPS 后再加 443），「不要」放行 ${PORT}。"
+  SG_NOTE="  安全组只放行 ${PROXY_PORT}，「不要」放行 ${PORT}。
+  要加 HTTPS：.env 里 NGINX_TEMPLATES_DIR=./deploy/nginx/tls、证书按 fullchain.pem +
+  privkey.pem 就位、TLS_CERT_DIR 指过去，再重跑本脚本（见 docs/DEPLOY.md §6.2）。"
 else
   HOST_PORT="$PORT"
   ENTRY_NOTE="  未启用反代：外界直连 api :${PORT}（HTTPS / 限流 / 真实 IP 要自己另配）。"
@@ -224,11 +274,25 @@ else
   不是代码问题。去控制台的安全组/防火墙里加一条入站规则。"
 fi
 
+# 验收命令按部署形态拼：HTTPS 下自签证书要 --ca（脚本不吃 curl 的 -k），
+# 而且证书一般是签给域名的 —— 用 IP 跑会验签失败，所以有域名就用域名。
+CURL_EXTRA=""
+PCHECK_URL="${SCHEME}://${IP}:${HOST_PORT}"
+PCHECK_HINT=""
+if [[ "$TLS_MODE" == "1" ]]; then
+  CURL_EXTRA=" -k"
+  SN="$(read_env SERVER_NAME)"
+  if [[ -n "$SN" && "$SN" != "_" ]]; then PCHECK_URL="https://${SN}"; fi
+  PCHECK_HINT="
+       （自签证书要加 --ca <证书路径>；上面的 -k 是 curl 的写法，脚本不吃。
+         证书是签给域名的，所以这里默认用域名跑，别用 IP。）"
+fi
+
 cat <<EOF
 
-  本机验证： curl -s http://127.0.0.1:${HOST_PORT}/health | python -m json.tool
-  公网验证： curl -s http://${IP}:${HOST_PORT}/health | python -m json.tool
-  API 文档： http://${IP}:${HOST_PORT}/docs
+  本机验证： curl -s${CURL_EXTRA} ${SCHEME}://127.0.0.1:${HOST_PORT}/health | python -m json.tool
+  公网验证： curl -s${CURL_EXTRA} ${SCHEME}://${IP}:${HOST_PORT}/health | python -m json.tool
+  API 文档： ${SCHEME}://${IP}:${HOST_PORT}/docs
   实时日志： docker compose logs -f api
   停止服务： docker compose down          （保留数据）
   清库重来： docker compose down -v       （会删 mysql 数据卷）
@@ -239,7 +303,7 @@ ${SG_NOTE}
   ⚠️ 上面两条 curl 都只是「从这台机器出发」，只能证明服务起来了，
      证明不了公网可访问 —— 而且 SSE 有没有被中间那层攒批，只有从**外面**看才知道。
      在你自己电脑上跑一次（要 requests）：
-       python tests/e2e/public_check.py --url http://${IP}:${HOST_PORT}
+       python tests/e2e/public_check.py --url ${PCHECK_URL}${PCHECK_HINT}
      本机通、外面也通、逐块到达也是分开的，才叫公网可访问（见 docs/DEPLOY.md §7.5）。
 
 EOF

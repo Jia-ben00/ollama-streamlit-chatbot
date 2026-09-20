@@ -117,6 +117,26 @@ exit 0
 # 实测那个位置放脚本会卡死整个 bash（见文件顶部 ① 的第二段）。需要时用真二进制的副本。
 GOOD_ENV = "MYSQL_ROOT_PASSWORD=abc123def456\nAPI_PORT=8000\n"
 
+# 仓库里那两份反代模板的**替身**：只要能被 deploy.sh 的「这一层是明文还是 HTTPS」
+# 判据（在模板里找 `ssl_certificate`）区分开就够了，不需要真配置。
+PLAIN_TEMPLATE = (b"server {\n"
+                  b"    listen ${LISTEN_PORT};\n"
+                  b"    location / { proxy_pass http://${API_UPSTREAM}; }\n"
+                  b"}\n")
+TLS_TEMPLATE = (b"server {\n"
+                b"    listen ${LISTEN_PORT};\n"
+                b"    return 301 https://$host$request_uri;\n"
+                b"}\n"
+                b"server {\n"
+                b"    listen ${LISTEN_TLS_PORT} ssl;\n"
+                b"    ssl_certificate     /etc/nginx/certs/fullchain.pem;\n"
+                b"    ssl_certificate_key /etc/nginx/certs/privkey.pem;\n"
+                b"}\n")
+# HTTPS 模式的 .env：三个开关（配置源、证书目录、443 端口）都到位。
+TLS_ENV = ("MYSQL_ROOT_PASSWORD=abc123def456\nAPI_BIND=127.0.0.1\nAPI_PORT=8000\n"
+           "PROXY_HTTP_PORT=80\nPROXY_HTTPS_PORT=443\n"
+           "NGINX_TEMPLATES_DIR=./deploy/nginx/tls\nTLS_CERT_DIR=./certs\n")
+
 
 def msys_path(p):
     """Windows 路径 → MSYS 能认的 POSIX 形态；Linux 上原样返回。
@@ -149,6 +169,13 @@ class DeployScriptTest(unittest.TestCase):
 
         self.calls_log = self.tmp / "calls.log"
         self.out_file = self.tmp / "run.out"
+
+        # 让临时目录与仓库**同形**：deploy.sh 检查「配置源目录在不在」
+        # （挂到不存在的目录上时，容器会去服务镜像自带的默认站点，也是 200，极难排查），
+        # 所以这里把明文那份模板补上。HTTPS 那份由各用例按需造（见 _templates_tree）。
+        plain = self.tmp / "deploy" / "nginx" / "templates"
+        plain.mkdir(parents=True)
+        (plain / "default.conf.template").write_bytes(PLAIN_TEMPLATE)
 
     # ── 基础设施 ────────────────────────────────────────────────────────
     def _exe(self, directory, name, text):
@@ -426,6 +453,84 @@ class DeployScriptTest(unittest.TestCase):
         # 别让人再手滑把 8000 放行到公网。
         self.assertIn("不要", p.output)
         self.assertIn("8000", p.output)
+
+    # ── HTTPS（TLS 模式的识别 + 证书前置检查）────────────────────────────
+    def _templates_tree(self, *, tls=True, certs=("fullchain.pem", "privkey.pem")):
+        """造出 deploy.sh 会去看的那几样东西（都用**相对路径**）。
+
+        deploy.sh 第二行 cd 到自己所在的目录（测试里就是 tmp），所以它眼里的 cwd
+        与仓库根目录同形 —— 相对路径这样才走得通，也和真实部署一致。
+        """
+        if tls:
+            d = self.tmp / "deploy" / "nginx" / "tls"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "default.conf.template").write_bytes(TLS_TEMPLATE)
+        if certs:
+            c = self.tmp / "certs"
+            c.mkdir(exist_ok=True)
+            for name in certs:
+                (c / name).write_bytes(b"-----BEGIN STUB-----\nstub\n-----END STUB-----\n")
+
+    def test_tls_mode_is_detected_from_the_config_not_the_dir_name(self):
+        """HTTPS 模式的判据是「待渲染的模板里有没有 ssl_certificate」。
+
+        用配置内容而不是目录名：目录名随便起，而「我到底在对外提供明文还是 TLS」
+        只有配置能回答。识别对了，收尾提示才会给出 https:// 与 443。
+        """
+        self._templates_tree()
+        self.write_env(TLS_ENV)
+        p = self.run_deploy("--proxy")
+        self.assertEqual(p.returncode, 0, p.output)
+        self.assertIn("HTTPS 反代", p.output)
+        self.assertIn("https://", p.output)
+        self.assertIn("443", p.output)
+        # 80 也不能被忘掉：跳转和 ACME 挑战都还在那儿，证书续期靠它。
+        self.assertIn("80", p.output)
+        self.assertIn("--profile proxy", p.calls)
+
+    def test_tls_without_the_private_key_is_refused_before_starting(self):
+        """证书缺一个就拒绝启动，而且是**在 up 之前**。
+
+        少了 privkey.pem，nginx 会在容器里当场退出；用户看到的却是「反代起不来 + 一串
+        看不懂的 nginx 日志」，还得先等构建跑完。拦在前面，并顺手给出两种解法。
+        """
+        self._templates_tree(certs=("fullchain.pem",))
+        self.write_env(TLS_ENV)
+        p = self.run_deploy("--proxy")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("privkey.pem", p.output)
+        self.assertIn("TLS_CERT_DIR", p.output)
+        self.assertNotIn("up -d", p.calls, "证书不齐就不该再起服务 —— 半配置的部署最难查")
+
+    def test_tls_without_any_certificates_is_refused(self):
+        self._templates_tree(certs=())
+        self.write_env(TLS_ENV)
+        p = self.run_deploy("--proxy")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("fullchain.pem", p.output)
+        self.assertNotIn("up -d", p.calls)
+
+    def test_missing_templates_dir_is_refused(self):
+        """配置源目录不存在 = 挂到一个空目录上，容器会去服务镜像自带的默认站点。
+
+        那种失败**也是 200**（只是 /health 变成 404），日志里只有一句 envsubst 没找到
+        模板 —— 很容易被当成「反代起来了，只是健康检查路径不对」。
+        """
+        self._templates_tree()
+        self.write_env(TLS_ENV.replace("./deploy/nginx/tls", "./deploy/nginx/tlss"))
+        p = self.run_deploy("--proxy")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("tlss", p.output)
+        self.assertNotIn("up -d", p.calls)
+
+    def test_plaintext_mode_does_not_require_certificates(self):
+        """证书检查只在 HTTPS 模式生效 —— 明文部署不该被它拦住（那是假警报）。"""
+        self.write_env("MYSQL_ROOT_PASSWORD=abc123def456\nAPI_BIND=127.0.0.1\n"
+                       "API_PORT=8000\nPROXY_HTTP_PORT=80\n")
+        p = self.run_deploy("--proxy")
+        self.assertEqual(p.returncode, 0, p.output)
+        self.assertIn("反代已启用", p.output)
+        # 没写 NGINX_TEMPLATES_DIR 时走默认值 ./deploy/nginx/templates（setUp 里造了）。
 
     # ── 拉代码 ──────────────────────────────────────────────────────────
     def test_pull_runs_git_pull_ff_only(self):
