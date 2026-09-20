@@ -14,6 +14,7 @@
 | 本机跑通整个后端（真 MySQL + 假 Ollama + 真 uvicorn，27 项断言） | ✅ 已验证 |
 | **在真实 Docker 里把整套 compose 跑起来** | ✅ **CI 每次 push 真跑**（`.github/workflows/container-smoke.yml`）；**2026-09-20 起本机也能真跑**（装上了 Docker Desktop）。镜像能构建、容器之间能互通、容器内 MySQL 的表真是 utf8mb4、密码没被拷进镜像、3306/6379 没暴露 |
 | **反代这一层（Nginx + 流式不被攒批）** | ✅ **两份配置都在仓库里，并且都用真 nginx 跑过**：`deploy/nginx/templates/`（明文）与 `deploy/nginx/tls/`（HTTPS）。验收是 `.github/scripts/container_smoke.sh` 第 9 步（`tests/e2e/nginx_check.py` 的 A/B/C/C′/D 五段），**每条通道都带一个必须被判成攒批的反例**。TLS 那半在本机用自签证书真起过；仍然没验的只剩「真域名 + ACME 签发续期」，见 §6.2 |
+| **反代路径的「第一条命令」（`deploy.sh --proxy`）** | ✅ **本机真跑过**（2026-09-20）：`.github/scripts/container_smoke.sh` 第 10 步（`tests/e2e/proxy_deploy_check.py`）。它验的正是上面那格**没覆盖**的一段 —— compose 里 `profiles: ["proxy"]` 真的生效、那颗「先探明文、失败再探 HTTPS」的双模式 healthcheck 在 TLS 下真的通过、明文口的 301 跟着跳真的到得了 HTTPS，以及 `public_check.py --ca` 这条分支第一次被执行 |
 | **在云主机上对公网提供服务** | ❌ **还没做过** —— 缺一台能跑 Docker Compose 的 Linux 主机 |
 
 最下面那行仍然是唯一没做到的：**还没有一台云主机**。上面的每一行都是这几轮补的，
@@ -323,6 +324,7 @@ python tests/e2e/public_check.py --url https://127.0.0.1:8443 --ca /path/to/cert
 | **build 卡在装依赖那一层很久**（几十分钟到几小时，没有报错） | 几乎一定是 PyPI 通道问题，不是代码问题。本机实测国内网络下官方源只有 ~45 KB/s，那一层跑了 3.7 小时；换镜像后同一层几分钟。改法：`.env` 里加一行 `PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` 再重跑（已完成的层会被缓存复用）。`deploy.sh` 会在构建前提醒，`container_smoke.sh` 会打印当前用的源 |
 | `deploy.sh --proxy` 直接拒绝，说 `API_BIND` 不是 `127.0.0.1` | 这是**故意**的，不是 bug：起了反代却让 api 绑 `0.0.0.0`，外面就能绕过反代直连 8000（HTTPS / 限流 / SSE 防缓冲那一层全白配）。按提示把 `.env` 里的 `API_BIND` 改成 `127.0.0.1` 再重跑。只想直连 8000 调试就别加 `--proxy` |
 | api 一直重启，日志 `Can't connect to MySQL` | 看 `docker compose logs mysql` 是不是初始化失败；`depends_on: service_healthy` 只保证「健康后再起 api」，若 mysql 自己起不来就要先修 mysql |
+| 用 `--proxy` 部署过，`docker compose down` 之后 `proxy` 容器**还在跑、还占着 80/443** | `docker compose down` **不会**停掉属于非激活 profile 的服务。必须带 profile：`docker compose --profile proxy down`（`deploy.sh` 收尾打印的就是这条）。不带的话网络也删不掉（`Network chatbot_default Resource is still in use`），下一次 `up` 直接端口冲突。实测 2026-09-20（compose v5.5.1 / Docker Desktop） |
 | `/health` 里 `redis: false` | compose 里 api 的 `REDIS_URL` 必须用服务名 `redis`，不能用 127.0.0.1 |
 | `.sh` 报 `bad interpreter: /bin/bash^M` | 文件被转成了 CRLF。仓库里 `.gitattributes` 已声明 `*.sh text eol=lf`，若仍出问题，`sed -i 's/\r$//' deploy.sh` |
 | 日志里 `Name or service not known` / `could not resolve host: host.docker.internal` | Linux 不自动解析这个名字，需要 api 的 `extra_hosts`（compose 里已内置）。若你删过那一行，加回来 |

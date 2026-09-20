@@ -382,7 +382,7 @@ bash .github/scripts/container_smoke.sh
 ## 🧪 运行测试
 
 ```bash
-# 全部测试（261 个用例，无需 Ollama / MySQL / Redis；界面测试用无头方式跑）
+# 全部测试（288 个用例，无需 Ollama / MySQL / Redis；界面测试用无头方式跑）
 python -m unittest discover tests -v
 ```
 
@@ -396,10 +396,11 @@ python -m unittest discover tests -v
 | `tests/test_cache.py` | 缓存层：TTL、主动失效、Redis 不可用时的降级 |
 | `tests/test_deploy_manifest.py` | 部署清单自洽性：从源码反推容器必须拿到的环境变量、.dockerignore 覆盖密钥、healthcheck 与 depends_on 对齐 |
 | `tests/test_deploy_manifest_guards.py` | 元测试：把每个要防的缺陷种回去，确认上面那些守卫真的会报错 |
-| `tests/test_deploy_script.py` | 部署脚本 `deploy.sh`：**用替身 `docker` 真跑**它的每条分支（没装 docker / 无 compose 插件 / 守护进程没跑 / 缺 `.env` / 密码缺失或不合格 / 参数打错 / `--proxy` 与 `API_BIND` / HTTPS 模式下的证书与配置源检查 / 就绪轮询；还把每次调用记下来，断言「它到底做了什么」） |
+| `tests/test_deploy_script.py` | 部署脚本 `deploy.sh`：**用替身 `docker` 真跑**它的每条分支（没装 docker / 无 compose 插件 / 守护进程没跑 / 缺 `.env` / 密码缺失或不合格 / 参数打错 / `--proxy` 与 `API_BIND` / HTTPS 模式下的证书与配置源检查 / 就绪轮询 / **收尾打印的「停止服务」必须带 `--profile proxy`**；还把每次调用记下来，断言「它到底做了什么」） |
 | `tests/test_nginx_config.py` | 明文反代模板 + compose 接线：关键 SSE 指令在不在、占位符与 compose 提供的那组是否一致、行尾是不是 LF |
 | `tests/test_nginx_tls.py` | HTTPS 那份模板：SSL 监听 / 明文只跳转 / 证书路径 / TLS 版本下限 / **两份模板的共享段必须逐字节相同** / 配置源可切换 / 私钥不进仓库 / 有意没做的 HSTS 与 HTTP/2 |
 | `tests/test_container_smoke_script.py` | 容器冒烟脚本里「端口」那段断言：抽出脚本原文 + stub 掉 `docker`，用确定性场景证明它**会等**、**会失败**，以及「假 Ollama 的端口没被别人占」 |
+| `tests/test_proxy_deploy_check.py` | 第 10 步（真跑 `deploy.sh --proxy`）那两个**守卫**：`.env` 改写必须可逆（按字节还原 + sha256）、冒烟只在「服务是本次自己拉起的」时才调它、以及这段检查自己的失败路径（缺 openssl / 拒绝改别人的 stack / healthcheck 必须真的 healthy / 宿主端口被抢答时只降级不误判） |
 
 > `tests/test_app.py` 是这一轮新增的能力：Streamlit 应用以前被认为「没法测」，
 > 现在用官方 `AppTest` 可以在无浏览器的情况下执行整个页面。它上线当天就抓到一个真问题——
@@ -409,7 +410,7 @@ python -m unittest discover tests -v
 
 ### CI
 
-`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **261 passed**。
+`.github/workflows/ci.yml` 在每次 push / PR 时跑：语法检查 → 单元测试，Python 3.11，期望 **288 passed**。
 
 CI 里刻意**只装 `requirements.txt`**（不含 torch），并有一条 guard 步骤会在 torch 意外出现时直接失败：
 装了 torch 的话每次 run 要多下 2–3GB，这正是「本地跑通 ≠ CI 跑通」最常见的坑。

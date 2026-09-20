@@ -14,8 +14,8 @@ Docker Desktop 4.91 / 引擎 29.8.0（2026-09-19 装上，在此之前本机没�
 
 | 验证项 | 结果 |
 |---|---|
-| 单元测试 | `Ran 261 tests ... OK`（领域 31 + HTTP 层 19 + 前端客户端 25 + 会话抽象 33 + 界面 4 + 缓存 4 + 部署清单 20 + 守卫元测试 8 + 上下文与缓存顺序 8 + 流式协议 12 + schema 快照 14 + **容器脚本守卫 10** + 流式判据 10 + 反代配置守卫 14 + **HTTPS 模板守卫 24** + **部署脚本守卫 25**） |
-| 反向对照（把缺陷种回去） | `tests/e2e/reverse_check.py` 六组全红：chat_stream 7/7、schema 8/8、**container_smoke 4/4**、stream_probe 4/4、**nginx 20/20**、**deploy_script 14/14**（共 57 条种回，全部变红），且每次改完按字节还原（sha256 校验） |
+| 单元测试 | `Ran 288 tests ... OK`（领域 31 + HTTP 层 19 + 前端客户端 25 + 会话抽象 33 + 界面 4 + 缓存 4 + 部署清单 20 + 守卫元测试 8 + 上下文与缓存顺序 8 + 流式协议 12 + schema 快照 14 + **容器脚本守卫 10** + 流式判据 10 + 反代配置守卫 14 + **HTTPS 模板守卫 24** + **部署脚本守卫 27** + **反代部署路径守卫 25**） |
+| 反向对照（把缺陷种回去） | `tests/e2e/reverse_check.py` 六组全红：chat_stream 7/7、schema 8/8、**container_smoke 4/4**、stream_probe 4/4、**nginx 20/20**、**deploy_script 15/15**（共 58 条种回，全部变红），且每次改完按字节还原（sha256 校验） |
 | 端到端冒烟（服务端视角） | `tests/e2e/smoke.py` 27 项断言全过 |
 | 端到端冒烟（前端视角） | `tests/e2e/frontend_smoke.py` 30 项断言全过 |
 | 建表 | 用仓库里的 `python -m db.init_db` 在空库建出 **6 张表**，collation 全 `utf8mb4_0900_ai_ci` |
@@ -23,7 +23,8 @@ Docker Desktop 4.91 / 引擎 29.8.0（2026-09-19 装上，在此之前本机没�
 | SSE 流式（服务端到客户端） | 9 个 chunk，块间隔均匀 **47ms**（服务端设定 50ms），`Content-Type: text/event-stream` |
 | SSE 流式（前端客户端读到的） | 9 个 chunk，块间隔 **[50, 51, 51, 51, 50, 51, 51, 50] ms** —— 前端侧没有二次缓冲 |
 | emoji 往返 | `表情测试 🚀😀🔥` 经 HTTP → MySQL → HTTP 无损，`@@character_set_connection = utf8mb4` |
-| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上真跑整套（**36 PASS / 0 FAIL，含明文 A/B 与 HTTPS C/C′/D，约 1 分 40 秒**，run `35489196611`）；**本机也跑通了**（2026-09-20，Docker Desktop）：`bash .github/scripts/container_smoke.sh` → **36 PASS / 0 FAIL**（8/9 端到端 22 条 + 9/9 反代 14 条）+ 7 项 shell 级 ✓，退出码 0，详见第 9 节 |
+| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上真跑整套（含明文 A/B、HTTPS C/C′/D，以及 `deploy.sh --proxy` 那一段）；**本机也跑通了**（2026-09-20，Docker Desktop）：`bash .github/scripts/container_smoke.sh` → **47 PASS / 0 FAIL**（8/10 端到端 22 条 + 9/10 反代 14 条 + **10/10 反代部署路径 11 条**）+ 10 项 shell 级 ✓，退出码 0，详见第 9 节 |
+| **上机第一条命令（`deploy.sh --proxy`）整条路径** | ✅ 本机真跑过（2026-09-20）：compose 的 `proxy` 服务真的起来了（`profiles: ["proxy"]` 生效）、那颗「先探明文、失败再探 HTTPS」的双模式 healthcheck 在 TLS 下真的通过、明文口 301 跟着跳到得了 HTTPS 200、`public_check.py --ca` 第一次真跑并退出 0；`.env` 全程按字节还原（sha256 一致）。**这条路径在本轮之前谁也没执行过** —— 而它正是云主机上的第一条命令 |
 | 容器里三个依赖探针 | `checks={"database":true,"redis":true,"ollama":true}` —— 分别证明「compose 服务名解析」「`REDIS_URL` 指向服务名」「`extra_hosts`/`host-gateway`」三处配置**真的生效**，而不只是写在文件里 |
 | 忽略规则与权限真的生效 | 容器内 `ls` 确认 `/app/.env`、`/app/.git`、`/app/tests`、`/app/app.py` 都不存在；容器内 `uid=1000`（非 root）；`mysql:{"3306/tcp":null}`、`redis:{"6379/tcp":null}`、`api: HostPort 8000` |
 | **HTTPS（TLS 握手 + 流式 + 尺子的反例）** | ✅ 本机验过：自签证书（SAN 含 `IP:127.0.0.1`）真起 TLS，`nginx_check.py` 的 C/C′/D 三段 —— 明文口 301 保留路径、真 TLS 下 `9 块 / 跨度 0.404s` 仍是 INCREMENTAL、默认信任链打自签证书必须 `SSLCertVerificationError`（证明证书校验真开着）、TLS 下开 buffering 必须被判 BUFFERED |
@@ -359,11 +360,13 @@ chunk_size=   1 | 首块 0.000s | 总 0.453s | 间隔 [0.063, 0.046, 0.047, 0.04
 跑 `.github/scripts/container_smoke.sh`。同一个脚本在云主机上就是**上线验收脚本**。
 
 > 2026-09-19 本机装上了 Docker Desktop（4.91 / 引擎 29.8.0 / compose v5.5.1），
-> 这条链在本机也能跑通了。2026-09-20 补上 HTTPS 之后本机复跑：
-> `bash .github/scripts/container_smoke.sh` → **36 PASS / 0 FAIL，退出码 0**
-> （8/9 端到端 22 条 + 9/9 反代验收 14 条）。第 9 步在**两条通道**上各量一次到达时刻：
+> 这条链在本机也能跑通了。2026-09-20 补上 HTTPS、再补上第 10 步之后本机复跑：
+> `bash .github/scripts/container_smoke.sh` → **47 PASS / 0 FAIL，退出码 0**
+> （8/10 端到端 22 条 + 9/10 反代验收 14 条 + 10/10 反代部署路径 11 条）。
+> 第 9 步在**两条通道**上各量一次到达时刻：
 > 明文 `9 块 / 跨度 0.405s`、真 TLS `9 块 / 跨度 0.404s`，两者都是 `INCREMENTAL`；
 > 同一把尺子在**两个反例**上（明文关掉 `proxy_buffering off`、TLS 下同样关掉）都判成 `BUFFERED`。
+> 第 10 步则是**真跑 `deploy.sh --proxy`**（见下面「第二条『谁也没执行过』的路径」）。
 >
 > 但「本机能跑」不是重点。重点是：**装上之后第一次真跑，暴露了三个此前没人看见的问题** ——
 > 每一个都不是「配置写错」，而是「检查本身不成立」。
@@ -504,8 +507,36 @@ badge 的含义就从「代码是对的」变成「代码是对的、而且今�
 全部通过：明文与 HTTPS 两条路径上，流式都没有退化成攒批，且判据在两个反例上确实会红。
 ```
 
-（本机同一条命令也是 **36 PASS / 0 FAIL**；CI 上 TLS 段是 `9 块 / 0.402s`、本机是 `0.404s`，
+（本机同一条命令现在是 **47 PASS / 0 FAIL**；CI 上 TLS 段是 `9 块 / 0.402s`、本机是 `0.404s`，
 差在噪声里 —— 两边量出来的都是 `INCREMENTAL`。）
+
+第 9 步之后还有第 10 步：**让 `deploy.sh --proxy` 真的把 compose 里那个 `proxy` 服务拉起来**。
+它此前谁也没启动过（第 9 步用的是 `nginx_check.py` 自己的容器），而它是云主机上的第一条命令。
+真实输出（本机，2026-09-20）：
+
+```text
+── 2. 真跑 deploy.sh --no-pull --proxy（HTTPS 形态）──
+[PASS] deploy.sh --proxy 退出码 0
+[PASS] deploy.sh 识别出 HTTPS 形态（收尾提示为「反代已启用（HTTPS）」）
+── 3. proxy 服务与它的双模式 healthcheck ──
+[PASS] compose 的 proxy 服务起来了（profiles: ["proxy"] 真的生效） | container=96002def1faf
+[PASS] proxy 的 healthcheck 通过（TLS 形态下那条 `||` 分支真的被执行了） | health=healthy
+── 4. 入口：明文 301 → HTTPS ──
+[WARN] 宿主上另有进程占着入口端口 | 127.0.0.1:80 被别的进程抢答：HTTP 404，Server=(无)
+       入口地址取 localhost:80（Server: nginx/1.27.5）
+[PASS] 明文 :80 不直接服务，只回 3xx | HTTP 301
+[PASS] 跟随 301 之后真的到达 HTTPS 并拿到 200（用自签证书校验） | HTTP 200
+── 5. 从宿主机验收入口：public_check.py --ca ──
+       证书校验：开（信任根换成 .../proxy_deploy_certs_xxx/fullchain.pem）
+[PASS] 回复是逐块到达的（中间那层没攒批） | 9 个 chunk 分布在 0.408s 里，首块 0.023s 到达
+[PASS] public_check.py --ca 退出码 0（入口验收全过） | rc=0
+[PASS] `.env` 已按字节还原（sha256 一致）
+```
+
+那条 `[WARN]` 不是本次部署的问题，恰恰是一个**假信号**的实证：宿主机上 80 端口被别的进程
+（本机是 Steam++）占着，而 Windows 允许两个进程**同时**绑 `0.0.0.0:80` —— 它回一个
+**没有 `Server` 头**的 404。于是「端口能连上」根本不等于「连到的是我们的服务」；
+判据只能是 `Server: nginx/...`，`127.0.0.1` 不行就换 `localhost`（IPv6 回环）。
 
 其中三条最能证明「配置真的生效」而不只是「写在文件里」：
 
@@ -520,6 +551,39 @@ badge 的含义就从「代码是对的」变成「代码是对的、而且今�
 `docker compose down -v` 会**删掉 MySQL 数据卷**——刚部署完就把线上库清了。
 改成「启动前服务已在跑 → 只断言、不收尾」。这类问题不写「上线后怎么用」这一节
 是发现不了的：**只考虑 CI 场景，脚本就是对的。**
+
+### 第二条「谁也没执行过」的路径：`deploy.sh --proxy`
+
+上一轮把 `deploy.sh`（不带 `--proxy`）送进了真跑。但**它旁边还有一条分支谁也没走过**：
+`bash deploy.sh --proxy` —— 也就是云主机上的**第一条命令**。
+
+漏掉它的原因很具体，而且每一层单看都「没问题」：
+
+- `container_smoke.sh` 第 5 步刻意**不加** `--proxy`，理由还写在注释里（第 9 步的
+  `nginx_check.py` 起的是**它自己的** nginx 容器，不需要 compose 里那个 proxy 服务）；
+- `tests/test_deploy_script.py` 用替身 `docker` 验的是**分支逻辑**，不是真容器；
+- `tests/test_nginx_tls.py` 验的是**编排文件里的文本**。
+
+于是三件事都没有答案：`profiles: ["proxy"]` 真的生效吗、那颗「先探明文、失败再探 HTTPS」
+的双模式 healthcheck 在 TLS 下真的会通过吗、「被收回到容器内网的 8000 + 对外的 443」外面
+到底能不能验收。补法是第 10 步（`tests/e2e/proxy_deploy_check.py`）。**第一次真跑就抓到三个真问题**：
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| 宿主上 `/health` 回 404 且 **没有 `Server` 头** | 宿主机 80 端口被**别的进程**抢答（本机是 Steam++）。Windows 允许两个进程**同时**绑 `0.0.0.0:80`，所以「端口能连上」根本不等于「连到的是我们的服务」 | 判据改成 `Server: nginx/...`；`127.0.0.1` 不行就换 `localhost`（IPv6 回环通常只有 Docker 在听），两个都不行才失败。抢答时打 `WARN` 并继续 —— 那不是本次部署的问题 |
+| `docker compose down` 之后 `proxy` 容器**还在跑、还占着 80/443**，网络报 `Resource is still in use` | `down` 不碰属于**非激活 profile** 的服务 | `container_smoke.sh` 的收尾与 `deploy.sh` 打印的提示都改成 `docker compose --profile proxy down`，并加了一条守卫钉住「打印出来的那条必须带 profile」 |
+| `public_check.py --ca` 在**第一步**就 `SSLError` | `--ca` / `--insecure` 只传给了**流式那一段**，`requests` 的 `/`、`/health` 仍走系统信任链 | 抽出 `configure_session()`，把信任根配到**整个 Session** 上（`--ca` 换根但校验仍开，`--insecure` 才关）。这条分支此前同样从没被执行过 |
+
+> 教训和上一轮同源：**「文件写对了」与「跑得起来」之间隔着一段距离**，只有真跑量得出它有多长。
+> 第 10 步真跑出来的数字：`deploy.sh --proxy` 退出码 0 → proxy 容器 `healthy`
+> → 明文 301 → 跟随到 HTTPS 200 → `public_check.py --ca` 退出 0，`.env` 按字节还原（sha256 一致）；
+> 整套冒烟从 36 项涨到 **47 PASS / 0 FAIL**（新增的 11 项全在第 10 步）。
+
+> 还有一条**假信号**值得单独记：第一次把冒烟和第 10 步与**全量单测并行**跑，
+> 第 8 步那条「块间隔贴合服务端节奏」红了 —— `gaps=[0.051, 0.05, 0.052, 0.343, 0.003, 0.001, 0.0, 0.001]`。
+> 单独重跑同一份代码，间隔是 `[0.051, 0.05, 0.053, 0.049, 0.05, 0.051, 0.051, 0.049]`，干净通过。
+> 结论：**时序类的断言对机器负载敏感** —— 别在同一台机器上一边跑 CPU 密集型测试一边量到达时刻，
+> 否则你量到的是自己的负载，不是被测对象。
 
 ---
 

@@ -210,16 +210,17 @@ python tests/e2e/public_check.py --url https://your-domain.com
 python tests/e2e/public_check.py --url http://127.0.0.1:8000 --no-ports
 ```
 
-四个验收脚本的分工是**刻意分开**的，别混：
+验收脚本的分工是**刻意分开**的，别混：
 
 | 脚本 | 在哪跑 | 需要什么 | 回答什么问题 |
 |---|---|---|---|
 | `smoke.py` | 本机 | 真 MySQL + 假 Ollama | 这套代码拼起来能跑吗（不经反代） |
-| `.github/scripts/container_smoke.sh` | 服务器上 / CI | Docker | **容器化部署**成立吗（镜像无凭据、非 root、端口不外露） |
+| `.github/scripts/container_smoke.sh` | 服务器上 / CI | Docker | **容器化部署**成立吗（镜像无凭据、非 root、端口不外露）；第 9/10 步还会真的量一次反代与 `deploy.sh --proxy` |
 | `nginx_check.py` | 有 Docker 的机器 | compose 已在跑 | **反代这一层**成立吗（上云之前就能验） |
+| `proxy_deploy_check.py` | 有 Docker 的机器 | 本次自己拉起的 compose | **上机第一条命令**（`deploy.sh --proxy`）整条路径成立吗 |
 | `public_check.py` | **从外面** | 一个能访问的 URL | **公网入口**成立吗（真的域名 / IP，经 HTTPS） |
 
-四个里只有 `nginx_check.py` 和 `public_check.py` 能发现「反代把流攒批了」这一类问题 ——
+其中只有 `nginx_check.py` 和 `public_check.py` 能发现「反代把流攒批了」这一类问题 ——
 而它恰恰是**最不容易被发现**的：功能完全正常、接口返回正确、落库也对，
 只是用户看到的从「一个字一个字蹦」变成「转圈等到最后出全文」。
 没有报错、没有告警，只有**到达时刻**能看出来。
@@ -339,6 +340,41 @@ D 段回答「这把尺子在 TLS 下还量得出攒批吗」（TLS 有记录层
 > 于是 `nginx_check.py` 和整套容器冒烟现在**本机就能跑**。但上面那条教训不变 ——
 > 它能被本机跑，是因为有人先把「这东西从没跑过」当成缺陷去处理了。）
 
+## 反代之后的最后一段：`proxy_deploy_check.py`（真跑 `deploy.sh --proxy`）
+
+`nginx_check.py` 起的是**它自己的** nginx 容器，图的是「不占 80 端口、不动 compose 形态」。
+但也正因为如此，**compose 里那个 `proxy` 服务从来没被启动过** —— 而
+`bash deploy.sh --proxy` 正是云主机上的第一条命令。这个脚本把它补上：
+
+```bash
+bash deploy.sh --proxy                                  # 云主机上的第一条命令（HTTPS 形态）
+python tests/e2e/proxy_deploy_check.py --owned          # 单独跑（服务必须是你刚拉起来的）
+python tests/e2e/proxy_deploy_check.py                  # 服务已在跑 → 直接拒绝
+```
+
+`container_smoke.sh` 第 10 步就是它，无需手动调用。它一次回答四件事：
+
+| 验什么 | 为什么不能只看文件 |
+|---|---|
+| `deploy.sh --proxy` 全程真跑 + 收尾按 HTTPS 形态打印 | 替身用例验的是**分支逻辑**，不是「真容器起得来」 |
+| `profiles: ["proxy"]` 真的生效、**双模式 healthcheck 真的通过** | 那颗 healthcheck 是「先探明文、失败再探 HTTPS」，TLS 形态下那条 `\|\|` 分支此前从没执行过 |
+| 明文口 301 **跟着跳真的到得了 HTTPS 200** | 模板用的是 `$host`（不含端口），非 443 端口下 Location 必然指到 443 —— 所以 `nginx_check.py` 为了不占 443，当时只断言了 scheme 与 path |
+| 从宿主机（=「外面」）用 `public_check.py --ca` 打一遍 | `--ca` 这条分支同样从没被执行过 |
+
+它是**会改 `.env` 的**（配置源 / 证书目录 / `API_BIND=127.0.0.1`），改完会**重建 api 容器** ——
+所以默认拒绝在别人的部署上跑，`--owned` 是显式的「这套服务是我刚拉起来的」。
+无论成功失败，`.env` 都按**字节**还原并校验 sha256。
+
+⚠️ 两个真跑才发现的坑，都写进断言里了：
+
+- **宿主端口被抢答**：Windows 允许两个进程同时绑 `0.0.0.0:80`，本机 80/443 被 Steam++ 占着，
+  它回一个**没有 `Server` 头**的 404。于是「端口能连上」根本不能作为「服务起来了」的证据 ——
+  判据必须是 `Server: nginx/...`，并且 `127.0.0.1` 不行时换 `localhost`（IPv6 回环）。
+- **`docker compose down` 不停 profile 服务**：`--proxy` 起来之后，不带 profile 的 `down`
+  会把 api/mysql/redis 删掉，**proxy 却原地留着**，还占着 80/443，网络也删不掉
+  （`Network chatbot_default Resource is still in use`），下一次 `up` 直接端口冲突。
+  所以收尾和打印的提示都带上了 `--profile proxy`。
+
 ## 反向对照：证明「守卫真的会红」
 
 ```bash
@@ -360,7 +396,7 @@ python tests/e2e/reverse_check.py deploy_script    # 只跑一组
 | `container_smoke` | 端口断言不等就绪 / 丢空状态健全性检查 / 端口缺失不再失败 / 假 Ollama 的端口守卫恒判空闲 | 4/4 全红 |
 | `stream_probe` | 尺子不判跨度 / 块数不足当通过 / 尺子不判首块位置 / 阈值参数不接线 | 4/4 全红 |
 | `nginx` | 明文 8 条（不关缓冲 / 退化成 HTTP1.0 / Connection 没置空 / 超时退回 60s / 上游写死 127.0.0.1 / 占位符小写 / 模板没挂进容器 / 模板不钉 LF）+ HTTPS 12 条（没开 ssl / 明文口不再跳转 / 证书路径不按约定 / TLS 下限被放开 / 挑战路径也被跳转 / 两份模板漂移 / 加了没验过的 HSTS / 配置源不能切换 / 443 写死不走变量 / 探针只认明文 / 私钥进仓库 / .env 没声明开关） | 20/20 全红 |
-| `deploy_script` | 密码行缺失时静默退出 / 空密码 / 默认密码 / 含 `@` 密码 / 缺 .env 不给修法 / 参数打错不报错 / `--no-pull` 失效 / `--proxy` 不查 API_BIND / 起反代不带 profile / 就绪承诺与实现脱钩 / 不就绪也报成功 / 部署脚本删数据卷 / **TLS 模式不检查证书** / **配置源目录不存在不拦** | 14/14 全红 |
+| `deploy_script` | 密码行缺失时静默退出 / 空密码 / 默认密码 / 含 `@` 密码 / 缺 .env 不给修法 / 参数打错不报错 / `--no-pull` 失效 / `--proxy` 不查 API_BIND / 起反代不带 profile / 就绪承诺与实现脱钩 / 不就绪也报成功 / 部署脚本删数据卷 / TLS 模式不检查证书 / 配置源目录不存在不拦 / **收尾提示的 down 不带 `--profile proxy`** | 15/15 全红 |
 
 **后三组守的不是业务代码，而是判据本身** —— 一个量不出东西的尺子，
 和一个量出「一切正常」的尺子长得一模一样。`stream_probe` 那把尤其值得守：
@@ -395,6 +431,11 @@ python tests/e2e/reverse_check.py deploy_script    # 只跑一组
 与 `container_smoke.sh` 第 5 步（在真 Docker 上真跑同一条命令）。
 于是服务器上那条 `bash deploy.sh && bash .github/scripts/container_smoke.sh`
 和 CI 里跑的**已经是同一件事**。
+
+> 2026-09-20 补了第 15 条：**收尾打印的「停止服务」必须带 `--profile proxy`**。
+> 它是第 10 步真跑 `deploy.sh --proxy` 时暴露的 —— 不带 profile 的 `down` 停不掉
+> proxy 容器（详见上面 `proxy_deploy_check.py` 那一节）。这条和 ⑨「起反代不带 profile」
+> 是同一件事的两端：**起对了、停错了，一样会把人卡住**。
 
 > 这一组的第一版还犯了个值得记下来的错：**锚点打错了位置**。
 > 原以为把 `read_env` 里那句 `|| true` 拆掉就能重现「静默退出」，种回去之后测试却没红 ——
