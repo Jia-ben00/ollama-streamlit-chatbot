@@ -10,10 +10,10 @@
 |---|---|
 | 镜像与编排文件（`Dockerfile` / `docker-compose.yml`） | ✅ 已写好 |
 | 部署脚本（`deploy.sh`） | ✅ 已写好，而且**被真跑过**：20 条替身 `docker` 用例走完它的每条分支（`tests/test_deploy_script.py`，进 CI），CI 的第 5 步还会用真 Docker 跑**同一条命令** |
-| 编排文件之间的自洽性（compose / Dockerfile / `.dockerignore` / `.env` 模板 / nginx 模板） | ✅ 静态校验守着：`tests/test_deploy_manifest.py`（20 用例）+ `tests/test_nginx_config.py`（14 用例）+ 证明这些守卫真会失败（8 用例），都在 CI 里 |
+| 编排文件之间的自洽性（compose / Dockerfile / `.dockerignore` / `.env` 模板 / nginx 模板） | ✅ 静态校验守着：`tests/test_deploy_manifest.py`（20 用例）+ `tests/test_nginx_config.py`（14 用例）+ `tests/test_nginx_tls.py`（24 用例，含**两份模板逐字节不漂移**、私钥不进仓库）+ 证明这些守卫真会失败（8 用例），都在 CI 里 |
 | 本机跑通整个后端（真 MySQL + 假 Ollama + 真 uvicorn，27 项断言） | ✅ 已验证 |
 | **在真实 Docker 里把整套 compose 跑起来** | ✅ **CI 每次 push 真跑**（`.github/workflows/container-smoke.yml`）；**2026-09-20 起本机也能真跑**（装上了 Docker Desktop）。镜像能构建、容器之间能互通、容器内 MySQL 的表真是 utf8mb4、密码没被拷进镜像、3306/6379 没暴露 |
-| **反代这一层（Nginx + 流式不被攒批）** | ✅ **配置在仓库里，并且用真 nginx 跑过**：`deploy/nginx/templates/`，验收是 `.github/scripts/container_smoke.sh` 第 9 步（`tests/e2e/nginx_check.py`），带一个**必须被判成攒批的反例**。仍然没验的只剩「真实域名 + 证书」那一层，见 §6.2 |
+| **反代这一层（Nginx + 流式不被攒批）** | ✅ **两份配置都在仓库里，并且都用真 nginx 跑过**：`deploy/nginx/templates/`（明文）与 `deploy/nginx/tls/`（HTTPS）。验收是 `.github/scripts/container_smoke.sh` 第 9 步（`tests/e2e/nginx_check.py` 的 A/B/C/C′/D 五段），**每条通道都带一个必须被判成攒批的反例**。TLS 那半在本机用自签证书真起过；仍然没验的只剩「真域名 + ACME 签发续期」，见 §6.2 |
 | **在云主机上对公网提供服务** | ❌ **还没做过** —— 缺一台能跑 Docker Compose 的 Linux 主机 |
 
 最下面那行仍然是唯一没做到的：**还没有一台云主机**。上面的每一行都是这几轮补的，
