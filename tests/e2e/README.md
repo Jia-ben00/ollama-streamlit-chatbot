@@ -250,21 +250,35 @@ python tests/e2e/public_check.py --url http://127.0.0.1:8100 --no-ports    # 终
 ## 反代验收：`nginx_check.py`（在**真 nginx** 上量，不是替身）
 
 `public_check.py` 要你先把服务上线、再从另一台机器打进来。这个脚本把同一件事
-**提到上云之前**：用**同一个 nginx 镜像、同一份仓库模板**（`deploy/nginx/templates/`）
-起一个反代容器，接在正在跑的 compose 上，量 SSE 的到达时刻。
+**提到上云之前**：用**同一个 nginx 镜像、同一份仓库模板**（明文的
+`deploy/nginx/templates/`，HTTPS 的 `deploy/nginx/tls/`）起一个反代容器，
+接在正在跑的 compose 上，量 SSE 的到达时刻。
 
 ```bash
 bash .github/scripts/container_smoke.sh     # 第 9 步就是它（CI 里每次都跑）
 python tests/e2e/nginx_check.py            # 也可以单独跑，前提是 compose 已在跑
 python tests/e2e/nginx_check.py --keep     # 失败时保留容器，便于进去看
+python tests/e2e/nginx_check.py --no-tls   # 跳过 HTTPS 段（= TLS 这层没验，别在 CI 上用）
 ```
 
-它做两件事，**第二件比第一件重要**：
+它做四件事，**反例比正例重要** —— 只有正例的话，「通过」什么都证明不了：
+一把恒真的尺子也长这样。
 
-1. 正例：仓库配置 → `api`（真应用）→ 必须判成 **INCREMENTAL**。
-2. 反例：把配置里的 `proxy_buffering` 打开 + 上游换成 `plain_sse.py` → 必须判成 **BUFFERED**。
+| 段 | 通道 | 上游 | 期望 |
+|---|---|---|---|
+| A | 明文（`deploy/nginx/templates`） | `api`（真应用，chunked） | **INCREMENTAL** |
+| B | 明文 + `proxy_buffering on` | `plain_sse.py`（靠关连接结束） | **BUFFERED**（反例） |
+| C | **真 TLS**（`deploy/nginx/tls`，自签证书） | `api`（真应用） | **INCREMENTAL** |
+| C′ | 同一个 C 容器，但**不给信任根** | — | 必须 `SSLCertVerificationError`（反例） |
+| D | TLS + `proxy_buffering on` | `plain_sse.py` | **BUFFERED**（反例） |
 
-只有正例的话，「通过」什么都证明不了：一把恒真的尺子也长这样。
+C / D 段是后补的。TLS 曾经是唯一**整层**没验过的地方，理由写的是「ACME 签发要有域名」——
+那个理由只覆盖**签发**那一半。C 段自签一张证书（用宿主上的 `openssl`：镜像里没有，
+`nginx:alpine` 与 `alpine` 基础镜像都不带 CLI），回答「TLS 之后流式还活着吗」；
+D 段回答「这把尺子在 TLS 下还量得出攒批吗」（TLS 有记录层分帧，会改变 `recv()` 的
+切分方式 —— 不测就只是猜）；C′ 则挡第三种偷懒：**根本没校验证书**
+（那样谁都能冒充，而且流式看起来照样「正常」）。
+
 反例必须红，才能说明这把尺子在这一层量得出东西 —— 和 `tests/test_stream_probe.py`
 里的能力检查是同一个道理，只是搬到了运行时。
 

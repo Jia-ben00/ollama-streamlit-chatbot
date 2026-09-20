@@ -240,26 +240,77 @@ python tests/e2e/public_check.py --url http://your-domain.com
 
 ### 6.2 HTTPS
 
-**本仓库的反代配置只管 HTTP**（这一层在 CI 里用真 nginx 跑过，见 §6.1）。
-TLS 不在这份配置里，需要额外加——原因很实在：ACME 签发要求一个真实域名指向一台
-有公网 IP 的机器，这个条件本项目**没有**，所以 TLS 那一层我们**没有验证过**，
-也就不提供一份没验过的证书配置（安全相关的配置写错的代价比没有更高）。
+反代这一层有两份模板，都在仓库里，**都真跑过**：
 
-两条可选路径：
+| 配置源（`.env` 的 `NGINX_TEMPLATES_DIR`） | 内容 | 怎么验的 |
+|---|---|---|
+| `./deploy/nginx/templates`（默认） | 明文，只监听 80 | §6.1：真 nginx 量到达时刻 + 一个必须被红掉的反例 |
+| `./deploy/nginx/tls` | 80 只做 301 + ACME 挑战，443 上 TLS | `python tests/e2e/nginx_check.py` 的 C / D 段（见下） |
+
+启用 HTTPS 要动几处，都在 `.env` 里：
+
+```bash
+# ① 配置源换成 HTTPS 那份
+NGINX_TEMPLATES_DIR=./deploy/nginx/tls
+# ② 证书按**固定名字**就位：fullchain.pem + privkey.pem
+#    （certbot 的 /etc/letsencrypt/live/<域名>/ 正好就是这两个名字，直接指过去）
+TLS_CERT_DIR=/etc/letsencrypt/live/your-domain.com
+# ③ 端口（默认就是 80 / 443，一般不用改）
+PROXY_HTTP_PORT=80
+PROXY_HTTPS_PORT=443
+
+bash deploy.sh --proxy      # up 之前先检查证书在不在，收尾打印 https:// 入口
+```
+
+证书缺文件时 `deploy.sh` 会**在启动之前**拒绝：否则 nginx 在容器里当场退出，
+而你看到的是一串 nginx 日志加一次白等的构建。
+
+#### 这一层验到了什么程度（边界说清楚）
+
+TLS 长期是本项目**唯一整层没验过**的东西。当初的理由是「ACME 签发要有真域名 + 公网 IP」——
+那个理由只覆盖**签发**那一半。「TLS 之后流式还活着吗」「这把尺子在 TLS 下量得出攒批吗」
+根本不需要域名：自签一张证书就能量。现在 `tests/e2e/nginx_check.py` 每次运行
+（含 CI 容器冒烟第 9 步）都会做这几件事，而且每组正例都配了反例：
+
+| 断言 | 同一次运行里必须红掉的反例 |
+|---|---|
+| 明文口只回 301（路径保留） | — |
+| 经真 TLS 握手后回复仍**逐块到达** | **D**：TLS + `proxy_buffering on` + 靠关连接结束的上游 → 必须判成 BUFFERED |
+| HTTPS 上 `/health` 200，`read_sse(use_tls=True)` 真的走了 TLS | **C**：不给信任根（默认信任链）去打自签证书 → 必须 `SSLCertVerificationError` |
+
+两个反例各挡一件事：**C 挡「根本没校验证书」**（谁都能冒充，流式当然也「正常」），
+**D 挡「尺子在 TLS 下失效」**（TLS 有记录层分帧，理论上会改变 `recv()` 的切分方式，
+不测就只是猜）。顺带一提，`read_sse` 的 `use_tls` 分支在写这段之前**从未被执行过** ——
+没被执行过的代码等于没写过。
+
+**还没验的**（必须等真域名，这里不含糊）：
+
+- **ACME 的签发与续期**。模板特意把 `/.well-known/acme-challenge/` 排在跳转之前，
+  就是为了续期能工作 —— 但这条只有真签发一次才能证明。**首次部署后手动跑一次
+  `certbot renew --dry-run`**：这是整套配置里唯一没法在本机验的环节。
+- **HSTS**（`Strict-Transport-Security`）**故意没加**：浏览器一旦记住就很难回退
+  （要等 max-age 过期，期间站点直接打不开）。等上面那条续期跑顺了再说。
+- **HTTP/2 故意没开**：多一层分帧与多路复用，而 SSE 在 h2 下的到达时刻没量过。
+  要开就先在 `nginx_check.py` 里把它量出来再加。
+
+#### 两条可选拓扑
 
 | 做法 | 说明 |
 |---|---|
-| 在更外层终结 TLS | 用云厂商的负载均衡 / CDN 挂证书，回源到这台机器的 80。改动最小，证书续期由云厂商管 |
-| 自己加 certbot | `certbot certonly --webroot` 签发，再把证书目录挂进 proxy 容器，并给 nginx 加一个 443 的 server 块。需要自己在模板里补，见 nginx 官方镜像文档 |
+| 在更外层终结 TLS | 用云厂商的负载均衡 / CDN 挂证书，回源到这台机器的 80。证书续期由云厂商管；仓库里那份明文配置直接能用 |
+| 本机终结（certbot + 仓库里的 HTTPS 模板） | `certbot certonly --webroot -w /var/www/certbot -d <域名>` 签发，`TLS_CERT_DIR` 指向 `live/<域名>/`，再 `deploy.sh --proxy`。上面那张表的边界同样适用 |
 
 无论走哪条，**效果都能用同一个判据验**：
 
 ```bash
+# 真实域名：证书由公信 CA 签发，直接跑
 python tests/e2e/public_check.py --url https://your-domain.com
+# 自签证书（还没域名 / 想先在本地把这一层量一遍）：把信任根换成那张证书
+python tests/e2e/public_check.py --url https://127.0.0.1:8443 --ca /path/to/cert.pem --no-ports
 ```
 
 它不看你用的是什么证书、什么拓扑，只量每块的到达时刻——HTTPS 之后流式是不是还活着，
-这才是唯一靠得住的判据。
+这才是唯一靠得住的判据。（`--insecure` 会关掉证书校验，只配在本机对自签证书量流式时用。）
 
 ## 7. 排查：第一次上云大概率会撞上的
 

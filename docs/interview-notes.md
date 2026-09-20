@@ -14,8 +14,8 @@ Docker Desktop 4.91 / 引擎 29.8.0（2026-09-19 装上，在此之前本机没�
 
 | 验证项 | 结果 |
 |---|---|
-| 单元测试 | `Ran 232 tests ... OK`（领域 31 + HTTP 层 19 + 前端客户端 25 + 会话抽象 33 + 界面 4 + 缓存 4 + 部署清单 20 + 守卫元测试 8 + 上下文与缓存顺序 8 + 流式协议 12 + schema 快照 14 + **容器脚本守卫 10** + 流式判据 10 + 反代配置守卫 14 + **部署脚本守卫 20**） |
-| 反向对照（把缺陷种回去） | `tests/e2e/reverse_check.py` 六组全红：chat_stream 7/7、schema 8/8、**container_smoke 4/4**、stream_probe 4/4、nginx 8/8、deploy_script 12/12，且每次改完按字节还原（sha256 校验） |
+| 单元测试 | `Ran 261 tests ... OK`（领域 31 + HTTP 层 19 + 前端客户端 25 + 会话抽象 33 + 界面 4 + 缓存 4 + 部署清单 20 + 守卫元测试 8 + 上下文与缓存顺序 8 + 流式协议 12 + schema 快照 14 + **容器脚本守卫 10** + 流式判据 10 + 反代配置守卫 14 + **HTTPS 模板守卫 24** + **部署脚本守卫 25**） |
+| 反向对照（把缺陷种回去） | `tests/e2e/reverse_check.py` 六组全红：chat_stream 7/7、schema 8/8、**container_smoke 4/4**、stream_probe 4/4、**nginx 20/20**、**deploy_script 14/14**（共 57 条种回，全部变红），且每次改完按字节还原（sha256 校验） |
 | 端到端冒烟（服务端视角） | `tests/e2e/smoke.py` 27 项断言全过 |
 | 端到端冒烟（前端视角） | `tests/e2e/frontend_smoke.py` 30 项断言全过 |
 | 建表 | 用仓库里的 `python -m db.init_db` 在空库建出 **6 张表**，collation 全 `utf8mb4_0900_ai_ci` |
@@ -23,10 +23,11 @@ Docker Desktop 4.91 / 引擎 29.8.0（2026-09-19 装上，在此之前本机没�
 | SSE 流式（服务端到客户端） | 9 个 chunk，块间隔均匀 **47ms**（服务端设定 50ms），`Content-Type: text/event-stream` |
 | SSE 流式（前端客户端读到的） | 9 个 chunk，块间隔 **[50, 51, 51, 51, 50, 51, 51, 50] ms** —— 前端侧没有二次缓冲 |
 | emoji 往返 | `表情测试 🚀😀🔥` 经 HTTP → MySQL → HTTP 无损，`@@character_set_connection = utf8mb4` |
-| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上真跑整套（**22 项 HTTP 断言 + 4 项容器内断言，1 分 30 秒**，run `35427086843`）；**本机也跑通了**（2026-09-20，Docker Desktop）：`bash .github/scripts/container_smoke.sh` → **28 项 HTTP 断言 + 10 项 shell 级检查全过，退出码 0**，含第 9 步真 nginx 反代验收，详见第 9 节 |
+| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上真跑整套（**22 项 HTTP 断言 + 4 项容器内断言，1 分 30 秒**，run `35427086843`）；**本机也跑通了**（2026-09-20，Docker Desktop）：`bash .github/scripts/container_smoke.sh` → **36 PASS / 0 FAIL**（8/9 端到端 22 条 + 9/9 反代 14 条：明文 A/B、HTTPS C/C′/D）+ 7 项 shell 级 ✓，退出码 0，详见第 9 节 |
 | 容器里三个依赖探针 | `checks={"database":true,"redis":true,"ollama":true}` —— 分别证明「compose 服务名解析」「`REDIS_URL` 指向服务名」「`extra_hosts`/`host-gateway`」三处配置**真的生效**，而不只是写在文件里 |
 | 忽略规则与权限真的生效 | 容器内 `ls` 确认 `/app/.env`、`/app/.git`、`/app/tests`、`/app/app.py` 都不存在；容器内 `uid=1000`（非 root）；`mysql:{"3306/tcp":null}`、`redis:{"6379/tcp":null}`、`api: HostPort 8000` |
-| 公网访问（安全组 / Nginx / HTTPS） | ❌ 未验证 —— 缺一台能跑 Docker Compose 的云主机，见最后一节 |
+| **HTTPS（TLS 握手 + 流式 + 尺子的反例）** | ✅ 本机验过：自签证书（SAN 含 `IP:127.0.0.1`）真起 TLS，`nginx_check.py` 的 C/C′/D 三段 —— 明文口 301 保留路径、真 TLS 下 `9 块 / 跨度 0.404s` 仍是 INCREMENTAL、默认信任链打自签证书必须 `SSLCertVerificationError`（证明证书校验真开着）、TLS 下开 buffering 必须被判 BUFFERED |
+| 公网访问（云主机 / 安全组 / **ACME 签发与续期**） | ❌ 未验证 —— 缺一台能跑 Docker Compose 的云主机；HTTPS 里「签发与续期」那一半需要真域名，只能上云才验得了，见最后一节 |
 
 ---
 
@@ -296,7 +297,7 @@ chunk_size=   1 | 首块 0.000s | 总 0.453s | 间隔 [0.063, 0.046, 0.047, 0.04
 |---|---|---|
 | 服务端读 Ollama | `iter_lines(chunk_size=512)`：攒够 512 字节才返回一次 | 显式 `chunk_size=1` |
 | 前端读后端 | 同一段代码逻辑，同样攒批 | 同上（复用同一个常量） |
-| Nginx 反代 | `proxy_buffering on` | 响应头加 `X-Accel-Buffering: no` |
+| Nginx 反代 | 默认 `proxy_buffering on` —— 但对 **chunked 上游**实测本就不攒批（明文 `0.405s` / TLS `0.404s`，与直连无异） | 仍显式写 `proxy_buffering off;`，属**纵深防御**：换成 close-delimited 上游时这层真会攒批（反例 D 实测 `BUFFERED`）。注意应用侧的 `X-Accel-Buffering` 头**客户端看不到**（被 nginx 消费掉），所以这层只能靠到达时刻判 |
 | 浏览器 / 中间件 | 一般不留缓冲，但压缩中间件、Service Worker 可能引入 | 视情况而定 |
 
 **所以「我做了 SSE」不等于「用户真的看到了流式输出」。** 端到端量一次到达间隔，才算数。
@@ -358,9 +359,11 @@ chunk_size=   1 | 首块 0.000s | 总 0.453s | 间隔 [0.063, 0.046, 0.047, 0.04
 跑 `.github/scripts/container_smoke.sh`。同一个脚本在云主机上就是**上线验收脚本**。
 
 > 2026-09-19 本机装上了 Docker Desktop（4.91 / 引擎 29.8.0 / compose v5.5.1），
-> 这条链在本机也能跑通了。本机首跑结果：`bash .github/scripts/container_smoke.sh`
-> **28 项 HTTP 断言 + 10 项 shell 级检查全过，退出码 0**，含第 9 步真 nginx 反代验收
-> （9 块跨度 0.404s，同一把尺子在反例上判成 `BUFFERED`）。
+> 这条链在本机也能跑通了。2026-09-20 补上 HTTPS 之后本机复跑：
+> `bash .github/scripts/container_smoke.sh` → **36 PASS / 0 FAIL，退出码 0**
+> （8/9 端到端 22 条 + 9/9 反代验收 14 条）。第 9 步在**两条通道**上各量一次到达时刻：
+> 明文 `9 块 / 跨度 0.405s`、真 TLS `9 块 / 跨度 0.404s`，两者都是 `INCREMENTAL`；
+> 同一把尺子在**两个反例**上（明文关掉 `proxy_buffering off`、TLS 下同样关掉）都判成 `BUFFERED`。
 >
 > 但「本机能跑」不是重点。重点是：**装上之后第一次真跑，暴露了三个此前没人看见的问题** ——
 > 每一个都不是「配置写错」，而是「检查本身不成立」。
@@ -591,12 +594,16 @@ badge 的含义就从「代码是对的」变成「代码是对的、而且今�
 被问到时照实说：这是当前范围外的事，加一个请求字段就能支持，
 只是**在没想清楚「参数该由谁决定」之前，不假装它已经支持**。
 
-**第四条**：容器的真实验证已经补上（见第 9 节，CI 每次 push 真跑整套 compose），
-但**「在云主机上对公网提供服务」这一步还没有做过**——缺一台能跑 Docker Compose 的
-Linux 主机。CI 的 runner 里没有公网入口，也没有真实的安全组，
-所以这两件事它盖不住：
+**第四条**：容器的真实验证已经补上（见第 9 节，CI 每次 push 真跑整套 compose）；
+Nginx 反代与 `proxy_buffering off` 对 SSE 的实际影响，也已经在**本机**用真 nginx 验过
+（明文 + 真 TLS 两条通道，各带一个反例，见第 9 节）。但**「在云主机上对公网提供服务」
+这一步还没有做过**——缺一台能跑 Docker Compose 的 Linux 主机。CI 的 runner 里没有
+公网入口，也没有真实的安全组，所以这几件事它盖不住：
 
 - 云安全组放行（典型故障：本机 curl 通、公网 curl 不通）；
-- Nginx 反代 + HTTPS，以及 `proxy_buffering off` 对 SSE 的实际影响。
+- **HTTPS 的证书签发与续期**（ACME / Let's Encrypt 需要真域名 + 公网可达的
+  `/.well-known/acme-challenge/`）—— 本机用自签证书验的是「TLS 之后流式还活着吗、
+  尺子在 TLS 上还准不准」，**签发那一半验不了**；
+- 真实公网链路上的中转（运营商 / CDN / 企业代理）会不会对 SSE 攒批。
 
-`docs/DEPLOY.md` 里对这两条都写了排查表，但**排查表不是实测**，别把它说成验证过。
+`docs/DEPLOY.md` 里对这几条都写了排查表，但**排查表不是实测**，别把它说成验证过。
