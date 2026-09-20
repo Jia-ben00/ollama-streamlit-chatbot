@@ -54,7 +54,7 @@ PYTHON="${PYTHON:-python3}"
 # 容器内一律用 `python`：python:3.11-slim 保证有它，而宿主机的解释器名字
 # （python3.12 / 绝对路径等）未必存在于容器里。两者分开，避免一类难懂的报错。
 PY_IN="python"
-FAKE_PORT=11434
+FAKE_PORT="${FAKE_PORT:-11434}"
 FAKE_LOG="/tmp/fake_ollama.log"
 FAKE_PID=""
 # 本次运行**之前**这套服务是不是已经在跑了。
@@ -153,6 +153,31 @@ docker compose config | grep -q 'host-gateway' \
   || die "compose 里没有 extra_hosts: host-gateway，容器将无法解析 host.docker.internal"
 ok "compose 配置可解析，变量插值正常，extra_hosts 已声明"
 
+# 报一下构建会走哪个 pip 源。
+#
+# 为什么值得单独打印：装依赖那一层是构建里最慢的一层，而快慢几乎完全取决于
+# PyPI 通不通 —— 本机实测（国内网络）官方源 ~45 KB/s，这一层跑了 3.7 小时；
+# 换国内镜像后同一层约 2 分钟。不打印的话，「构建卡住了」和「构建就是这么慢」
+# 在屏幕上长得一模一样，只能靠等几小时来区分。
+PIP_SRC="$(docker compose config --format json 2>/dev/null | "$PYTHON" -c "
+import json, sys
+try:
+    cfg = json.load(sys.stdin)
+    b = cfg.get('services', {}).get('api', {}).get('build') or {}
+    print((b.get('args') or {}).get('PIP_INDEX_URL') or '?')
+except Exception:
+    print('?')
+" 2>/dev/null || echo '?')"
+case "$PIP_SRC" in
+  *pypi.org*)
+    warn "构建走官方 PyPI（${PIP_SRC}）。国内网络下这一层可能非常慢（实测 45 KB/s，数小时）。"
+    warn "  加速：export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple 后重跑本脚本" ;;
+  "?"|"")
+    warn "读不出构建用的 pip 源（compose 的 api.build.args.PIP_INDEX_URL）。不影响继续跑。" ;;
+  *)
+    ok "构建 pip 源：${PIP_SRC}" ;;
+esac
+
 # 记录「本次运行之前服务是否已在跑」。必须在 up 之前判断 —— 这一步决定了
 # 最后要不要 down -v（线上验收时不能碰别人的服务，更不能删数据卷）。
 if [[ -n "$(docker compose ps -q 2>/dev/null)" ]]; then
@@ -162,6 +187,37 @@ fi
 
 # ── 4. 起假 Ollama ─────────────────────────────────────
 log "4/9 启动假 Ollama（绑 0.0.0.0:${FAKE_PORT}）"
+
+# 先确认这个端口**没有别人占着**，再起替身。这是一个 fail-closed 的前置检查，
+# 因为「端口能连上」和「连到的是我们的替身」是两件事：
+#
+#   · Windows 允许 `0.0.0.0:11434` 和 `127.0.0.1:11434` **同时**绑定（Linux 会直接
+#     EADDRINUSE）。所以本机装了真 Ollama 时，我们的替身照样能起来 —— 而容器里的
+#     host.docker.internal 经 Docker Desktop 转发出来是打到宿主机**回环**的，
+#     于是容器连到的是那个真 Ollama。现象极难查：/health 里 `ollama: true`
+#     （真 Ollama 答的 /api/tags），/chat 却返回 404 `model 'llama3.2' not found`
+#     （真 Ollama 没这个模型），冒烟脚本只报「流式返回 0 个 chunk」。
+#   · Linux 上同一个洞换一种表现：替身 bind 失败，而下面的「等端口」被**别人**应答，
+#     脚本照样打印「假 Ollama 已监听」—— 那句成功是假的。
+#
+# 这样检查之后，端口要么是我们的替身（下面还会验指纹），要么这里就报错。
+port_busy() {
+  "$PYTHON" -c "
+import socket, sys
+s = socket.socket(); s.settimeout(0.3)
+sys.exit(0 if s.connect_ex(('127.0.0.1', ${FAKE_PORT})) == 0 else 1)
+" 2>/dev/null
+}
+if port_busy; then
+  die "端口 ${FAKE_PORT} 上已经有服务在应答，容器会连到它而不是假 Ollama。
+       本机常见原因：装了真 Ollama（它默认就占 11434）。
+       两种改法：
+         a) 停掉它再重跑本脚本；
+         b) 换个端口，并让容器也一起换（OLLAMA_BASE_URL 与 .env 里同名，
+            compose 插值时 shell 环境优先于 .env）：
+              FAKE_PORT=11500 OLLAMA_BASE_URL=http://host.docker.internal:11500 bash .github/scripts/container_smoke.sh"
+fi
+
 # 必须绑 0.0.0.0：容器里的 host.docker.internal 解析到的是宿主机在 docker 网桥上的
 # 地址（如 172.17.0.1），不是回环 127.0.0.1。只绑回环的话宿主机 curl 得通、
 # 容器连不上，报错还是 "Connection refused"，很容易误判成服务没起来。
@@ -171,22 +227,49 @@ FAKE_PID=$!
 
 STARTED=0
 for _ in $(seq 1 40); do
-  if "$PYTHON" -c "
-import socket, sys
-s = socket.socket(); s.settimeout(0.3)
-sys.exit(0 if s.connect_ex(('127.0.0.1', ${FAKE_PORT})) == 0 else 1)
-" 2>/dev/null; then STARTED=1; break; fi
+  if port_busy; then STARTED=1; break; fi
   sleep 0.25
 done
 if [[ "$STARTED" != "1" ]]; then
   cat "$FAKE_LOG" || true
   die "假 Ollama 没起来（端口 ${FAKE_PORT} 被占用？）"
 fi
-ok "假 Ollama 在 0.0.0.0:${FAKE_PORT} 监听（pid=${FAKE_PID}）"
+
+# 验指纹：起得来还不够，要确认应答的**就是**我们的替身。
+# 指纹用 /api/tags 里那条只有替身会返回的记录（真 Ollama 返回的是它自己装的模型）。
+FAKE_ID="$("$PYTHON" - "${FAKE_PORT}" <<'PY' 2>/dev/null || echo "?"
+import json, sys, urllib.request
+try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/api/tags", timeout=3) as r:
+        models = json.load(r).get("models", [])
+except Exception as exc:                     # 连不上 / 不是 HTTP 服务
+    print("ERR:" + type(exc).__name__)
+else:
+    ours = [m for m in models if m.get("name") == "llama3.2" and m.get("size") == 2019393189]
+    print("OURS" if ours else "OTHER:" + ",".join(str(m.get("name")) for m in models))
+PY
+)"
+if [[ "$FAKE_ID" != "OURS" ]]; then
+  kill "$FAKE_PID" 2>/dev/null || true
+  die "端口 ${FAKE_PORT} 上应答的不是我们的假 Ollama（探测结果：${FAKE_ID}）。
+       容器会连到那个服务，后面的流式断言全部失去意义 —— 所以这里直接停。
+       照上面第 4 步的两条改法处理（停掉占用者，或换 FAKE_PORT 并同步 OLLAMA_BASE_URL）。"
+fi
+ok "假 Ollama 在 0.0.0.0:${FAKE_PORT} 监听（pid=${FAKE_PID}，指纹已核对）"
 
 # ── 5. 构建并启动整套服务 ──────────────────────────────
-log "5/9 构建镜像并启动（mysql / redis 健康后 api 才启动）"
-docker compose up -d --build
+# 刻意**不**直接写 `docker compose up -d --build`，而是调真正的 deploy.sh ——
+# 也就是云主机上那一步。理由：`deploy.sh` 长期从没被执行过（CI 只跑本脚本，
+# 静态校验只把它当文本读），而它是文档里「上机第一步」。
+# 走它之后，服务器上的 `bash deploy.sh && bash .github/scripts/container_smoke.sh`
+# 和 CI 里跑的**就是同一件事**了。
+#
+# `--no-pull`：CI 的 checkout 已经是权威版本，再 git pull 没有意义也不安全。
+# 不加 `--proxy`：反代的验收在第 9 步自己做（它会起自己的 nginx 容器，
+# 不需要 compose 里那个 proxy 服务，也就不会去占 80 端口）。
+# deploy.sh 自己会轮询 /health/ready（第 7 步再做一次，那时已经是秒过）。
+log "5/9 构建镜像并启动（真跑 deploy.sh --no-pull）"
+bash deploy.sh --no-pull
 docker compose ps
 
 # ── 6. 容器内断言 ──────────────────────────────────────
@@ -258,6 +341,31 @@ done
 echo "$api_ports" | grep -q 'HostPort' \
   || die "等了 ${PORT_WAIT_SECS}s，api 仍没有映射到宿主机的端口，外部访问不到（ports=$api_ports）"
 ok "api 已向宿主机暴露端口（$api_ports）"
+
+# ④ 容器连到的确实是我们的假 Ollama，而不是那个端口上别人的服务。
+#
+# 第 4 步已经在本机验过指纹，但**容器走的是另一条路**（host.docker.internal 经
+# Docker Desktop / docker0 网关出去）。本机实测过一起真实事故：宿主机装着真 Ollama
+# （占 127.0.0.1:11434），替身照样在 0.0.0.0:11434 起来了（Windows 允许两者共存），
+# 容器却连到了真 Ollama —— `/health` 里 `ollama: true`（真 Ollama 答的 /api/tags），
+# `/chat` 返回 404 `model 'llama3.2' not found`，而冒烟脚本只报「流式返回 0 个 chunk」。
+# 这条断言把那个看不懂的失败变成一条能照着修的报错。
+FAKE_SEEN="$(docker compose exec -T api "$PY_IN" -c "
+import json, urllib.request
+try:
+    with urllib.request.urlopen('http://host.docker.internal:${FAKE_PORT}/api/tags', timeout=5) as r:
+        models = json.load(r).get('models', [])
+except Exception as exc:
+    print('FAKECHECK=ERR:' + type(exc).__name__)
+else:
+    ours = [m for m in models if m.get('name') == 'llama3.2' and m.get('size') == 2019393189]
+    print('FAKECHECK=' + ('OURS' if ours else 'OTHER:' + ','.join(str(m.get('name')) for m in models)))
+" 2>/dev/null | tr -d '\r' | grep '^FAKECHECK=' | tail -1)" || true
+# 拿不到标记必须与「不是替身」分开报：读取失败返回空 → 不能当成通过（fail-closed）。
+[[ -n "$FAKE_SEEN" ]] || die "拿不到容器内对假 Ollama 的探测结果（api 容器没起来，或 exec 失败）"
+[[ "$FAKE_SEEN" == "FAKECHECK=OURS" ]] \
+  || die "容器连到的不是假 Ollama（${FAKE_SEEN#FAKECHECK=}）—— host.docker.internal:${FAKE_PORT} 上是别人的服务（本机常见：真 Ollama）。在这种状态下，后面的流式断言全部失去意义"
+ok "容器确实连到假 Ollama（host.docker.internal:${FAKE_PORT}，指纹一致）"
 
 # ── 7. 等就绪 + 灌种子数据 ─────────────────────────────
 log "7/9 等 API 就绪"
