@@ -34,6 +34,7 @@ import os
 import socket
 import sys
 import time
+import warnings
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -126,6 +127,28 @@ def check_ports(host: str, ports, control_port: int) -> None:
                             if state == "filtered" else ""))
 
 
+def configure_session(session, *, use_tls, ca, insecure):
+    """把「信任什么证书」一次配到这个会话上，而不是只配流式那一段。
+
+    踩过的坑（2026-09-20，由 `deploy.sh --proxy` 真跑暴露）：`--ca` / `--insecure`
+    一开始**只传给了 `read_sse`**，于是 `requests` 发的那几条（`/`、`/health`、
+    `/conversations`…）仍然走系统信任链 —— 拿自签证书验收时**第一步就
+    `SSLError`**，而这两个开关的用途恰恰就是自签场景。真证书（Let's Encrypt）
+    下系统信任链是通的，所以这个 bug 在云上反而看不见。
+
+    注意 `--ca` 与 `--insecure` 的区别要保住：`--ca` 是**换信任根，校验仍然开着**；
+    只有 `--insecure` 才关校验，而且它只允许在本机量自签证书时用。
+    """
+    if not use_tls:
+        return session
+    if insecure:
+        session.verify = False
+        warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+    elif ca:
+        session.verify = ca
+    return session
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="公网入口验收")
     ap.add_argument("--url", default=os.getenv("PUBLIC_URL", "http://127.0.0.1:8000"),
@@ -161,7 +184,9 @@ def main() -> int:
             print("证书校验：开（系统信任链）")
     print()
 
-    s = requests.Session()
+    # 信任根要在**开跑之前**就配好：后面每一条请求都经过这个会话。
+    s = configure_session(requests.Session(), use_tls=use_tls,
+                          ca=args.ca, insecure=args.insecure)
 
     # ── 0. 通不通 ────────────────────────────────────────
     try:
