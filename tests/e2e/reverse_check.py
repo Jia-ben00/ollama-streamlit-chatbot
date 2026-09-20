@@ -5,7 +5,7 @@
 「测试全绿」本身不能证明测试有效 —— 断言写松了、写成恒真条件，一样全绿。
 唯一可靠的判据是：把缺陷种回去，看它会不会失败。
 
-本脚本覆盖五组：
+本脚本覆盖六组：
 
 | 分组 | 被测对象 | 对应用例 |
 |---|---|---|
@@ -14,6 +14,13 @@
 | `container_smoke` | `.github/scripts/container_smoke.sh` 的端口断言等待逻辑 | `tests/test_container_smoke_script.py` |
 | `stream_probe` | `src/stream_probe.py` 的「流式有没有退化成攒批」判据 | `tests/test_stream_probe.py` |
 | `nginx` | `deploy/nginx/templates/default.conf.template` + compose 挂载 + `.gitattributes`（关缓冲 / HTTP1.1 / Connection 置空 / 超时 / 上游用服务名 / 占位符全大写 / 模板真挂上） | `tests/test_nginx_config.py` |
+| `deploy_script` | `deploy.sh` 的每一条前置检查与分支（没装 docker / 无 compose 插件 / 守护进程不可用 / 缺 .env / 密码缺失或不合格 / 参数打错 / `--proxy` 与 API_BIND / `--no-pull` / 轮询上限） | `tests/test_deploy_script.py` |
+
+`deploy_script` 这一组和 `container_smoke` 是同一类：**被测文件长期处于「谁也没执行过」的状态**。
+`deploy.sh` 是文档里「上机第一步」，但 CI 直接跑 `container_smoke.sh`，静态校验只把它当文本读
+（查行尾、查字符串）。第一次真跑（替身 docker）就抓到一个静态校验永远看不见的洞 ——
+`.env` 少一行 `MYSQL_ROOT_PASSWORD=` 时，脚本**连一句输出都没有**就退出（`set -e` + `pipefail`）。
+所以这里把每条检查逐个拆掉，确认真的有用例在看它。
 
 最后两组守的都不是业务代码，而是**判据本身**：一个量不出东西的尺子，
 和一个量出「一切正常」的尺子长得一模一样。`stream_probe` 那把尤其值得守——
@@ -92,6 +99,16 @@ HEALTH_TCP_CHECK = r'''  echo "$ports" | grep -q 'tcp' \
 API_PORT_DIE = r'''echo "$api_ports" | grep -q 'HostPort' \
   || die "等了 ${PORT_WAIT_SECS}s，api 仍没有映射到宿主机的端口，外部访问不到（ports=$api_ports）"'''
 
+# 起假 Ollama **之前**那句「端口没被别人占」的探测（2026-09-20 起）。
+#
+# 它是被一次真实事故逼出来的：本机装着真 Ollama（占 127.0.0.1:11434），而 Windows
+# 允许 `0.0.0.0:11434` 与它同时绑定，于是替身照样起来了 —— 容器却连到了真 Ollama。
+# 表现是 /health 里 `ollama: true`（真 Ollama 答的 /api/tags）而 /chat 返回 404
+# `model 'llama3.2' not found`，冒烟脚本只报「流式返回 0 个 chunk」。
+# 这条变异把它拆成「恒判空闲」，于是那句前置检查永远不会触发。
+BUSY_PROBE = r'''sys.exit(0 if s.connect_ex(('127.0.0.1', ${FAKE_PORT})) == 0 else 1)'''
+BUSY_PROBE_DEAD = r'''sys.exit(1)'''
+
 # ── stream_probe 组的锚点 ────────────────────────────────────────
 # 这一组被测的是「公网入口那把尺子」本身：src/stream_probe.py 里判断
 # 「回复还是不是逐块到达」的判据。为什么尺子也要做反向对照 ——
@@ -123,6 +140,50 @@ PROXY_PASS = "proxy_pass http://${API_UPSTREAM};"
 SERVER_NAME_LINE = "server_name ${SERVER_NAME};"
 TEMPLATE_MOUNT = "./deploy/nginx/templates:/etc/nginx/templates:ro"
 GITATTR_TEMPLATE_LF = "*.template text eol=lf"
+
+# ── deploy_script 组的锚点 ──────────────────────────────────────
+# 这一组和 container_smoke 是同一类：被测文件长期处于「谁也没执行过」的状态。
+# deploy.sh 是文档里的「上机第一步」，但 CI 直接跑 container_smoke.sh，
+# 静态校验（tests/test_deploy_manifest.py）只把它当**文本**读 —— 查行尾、查字符串。
+# 第一次真跑（替身 docker）就抓到一个静态校验永远看不见的洞：
+# `.env` 里少一行 MYSQL_ROOT_PASSWORD= 时，脚本连一句输出都没有就退出。
+#
+# 下面每条锚点都对应脚本里一个「要不要继续」的判断。逐个拆掉，确认真的有条用例在看它：
+# 把部署脚本的守卫拆空，它就会「成功」地部署出一个后门全开的服务，然后打印部署完成。
+DS = REPO / "deploy.sh"
+TDS = "tests.test_deploy_script"
+
+# ⚠️ 锚点必须打在**调用点**，不能打在 read_env 内部 —— 第一版打在内部，
+#    种回去之后测试**没变红**，也就是那条用例压根没被验证过。原因值得记下来：
+#
+#    `set -e` 不会中止**命令替换的子壳**，子壳的退出码只取决于它的最后一条命令。
+#    实测（同一份探针跑两个实现，结论一致）：
+#      Linux bash 5.2.37（容器里）与 Cygwin bash 5.3.15（本机 Git Bash）
+#      `echo "$(false; echo INSIDE)"`           → 打印 INSIDE 并继续（rc=0）
+#      `x="$(false)"`（顶层赋值）               → 静默退出（rc=1）
+#      `f(){ false; }; f` / `( false; echo X )` → 退出（rc=1）
+#    于是：
+#      · 历史形态 `PW="$(grep ... | head | cut)"` 是**顶层赋值** ⇒ 拿到失败状态 ⇒
+#        errexit 让整个脚本静默退出（本组存在的理由）。
+#      · 同一根管道包进以 `printf` 收尾的函数、再用 `PW="$(read_env ...)"` 调用 ⇒
+#        子壳跑到底、返回 printf 的 0 ⇒ 失败被**转成空串**，脚本继续往下走。
+#    两种坏法由**不同的东西**兜住：前者靠 `|| true`，后者靠调用方显式判空
+#    `[[ -n "$PW" ]] || die`。所以拆掉 read_env 里的 `|| true` 行为完全不变
+#    （实测），真正在接线的是调用方那句判空 —— 锚点因此打在这里。
+PW_READ_CALL = r'''PW="$(read_env MYSQL_ROOT_PASSWORD)"'''
+PW_READ_CALL_OLD = r'''PW="$(grep -E '^MYSQL_ROOT_PASSWORD=' .env | head -1 | cut -d= -f2-)"'''
+PW_NOT_EMPTY = r'''[[ -n "$PW" ]] || die'''
+PW_NOT_DEFAULT = r'''[[ "$PW" != "change-me" && "$PW" != "123456" ]] || die'''
+PW_NO_AT = r'''if [[ "$PW" == *"@"* ]]; then'''
+ENV_FILE_CHECK = r'''[[ -f .env ]] || die "缺少 .env。先执行：cp .env.prod.example .env 然后填好 MYSQL_ROOT_PASSWORD"'''
+UNKNOWN_ARG = r'''    *) die "不认识的参数：$arg（只支持 --no-pull / --proxy）" ;;'''
+NO_PULL_FLAG = r'''    --no-pull) PULL=0 ;;'''
+BIND_LOOPBACK = r'''  if [[ "$BIND" != "127.0.0.1" ]]; then'''
+PROFILE_UP = r'''  docker compose --profile proxy up -d --build'''
+READY_PROMISE = r'''log "等待 API 就绪（轮询 http://127.0.0.1:8000/health/ready，最多 ${READY_TIMEOUT} 秒）"'''
+READY_PROMISE_FIXED = r'''log "等待 API 就绪（轮询 http://127.0.0.1:8000/health/ready，最多 180 秒）"'''
+READY_GUARD = r'''if [[ "$READY" != "1" ]]; then'''
+DEPLOY_DONE = r'''log "部署完成"'''
 
 GROUPS = {
     "chat_stream": [
@@ -182,6 +243,10 @@ GROUPS = {
         ("端口缺失不再失败", CS, API_PORT_DIE,
          '''echo "$api_ports" | grep -q 'HostPort' || true''',
          TCS + ".TestContainerSmokePortWait.test_端口始终没有映射时应失败"),
+        # 起替身前的端口占用检查被拆成「恒判空闲」：于是「端口上有人」这条分支
+        # 再也不会走到，容器连到别人家的服务时脚本不再早停。
+        ("端口守卫恒判空闲", CS, BUSY_PROBE, BUSY_PROBE_DEAD,
+         TCS + ".TestFakeOllamaPortGuard.test_端口被占用时报忙"),
     ],
     "stream_probe": [
         # ① 不判「跨度」——最典型的假修法：块数、内容、Content-Type 全对，只是全挤在一起。
@@ -228,6 +293,54 @@ GROUPS = {
         ("模板不钉 LF", GITATTRIBUTES, GITATTR_TEMPLATE_LF,
          "*.template text eol=crlf",
          TNX + ".TestLineEndings.test_gitattributes_forces_lf_for_nginx_config"),
+    ],
+    "deploy_script": [
+        # ① 密码行读不到时**静默退出** —— 本组存在的起点，也是锚点打过一次错的教训。
+        #    种回历史形态（顶层裸管道）：grep 返回 1 + pipefail + set -e，
+        #    赋值语句直接终止脚本，连 [FAIL] 都不打印。
+        #    所以这条用例不能只断言"失败了"，必须断言输出里**出现了变量名** ——
+        #    「退出码非 0」对静默退出和明确报错是一回事，只有"说了什么"能区分。
+        ("密码行缺失时静默退出", DS, PW_READ_CALL, PW_READ_CALL_OLD,
+         TDS + ".DeployScriptTest.test_env_without_password_line_fails_loudly"),
+        # ②③④ 密码挡位：空值 / 模板默认值 / 含 @（会把 DATABASE_URL 的主机名解析坏）。
+        #    这三条都属于「拆掉以后脚本照样跑完并说成功」——功能上看不出任何异常，
+        #    只有公网被别人扫到才知道。所以必须有人在看。
+        ("空密码不再拦住", DS, PW_NOT_EMPTY, "true || die",
+         TDS + ".DeployScriptTest.test_empty_password_is_rejected"),
+        ("默认占位密码不再拦住", DS, PW_NOT_DEFAULT, "true || die",
+         TDS + ".DeployScriptTest.test_placeholder_passwords_are_rejected"),
+        ("含 @ 的密码不再拦住", DS, PW_NO_AT, "if false; then",
+         TDS + ".DeployScriptTest.test_password_with_at_is_rejected_with_the_reason"),
+        # ⑤ 少 .env 时只说「缺少 .env」——没给能照抄的下一步
+        ("缺 .env 不给修法", DS, ENV_FILE_CHECK,
+         r'''[[ -f .env ]] || die "缺少 .env"''',
+         TDS + ".DeployScriptTest.test_missing_env_tells_you_to_copy_the_template"),
+        # ⑥ 参数打错一个字母就当没看见 → 静默按「不带反代」部署，入口根本没起来
+        ("参数打错不报错", DS, UNKNOWN_ARG, "    *) : ;;",
+         TDS + ".DeployScriptTest.test_unknown_flag_is_rejected"),
+        # ⑦ --no-pull 变成空操作：CI / 重复部署会去 git pull，在分支分叉时把服务器带偏
+        ("--no-pull 不生效", DS, NO_PULL_FLAG, "    --no-pull) : ;;",
+         TDS + ".DeployScriptTest.test_no_pull_skips_git_pull"),
+        # ⑧ 起了反代却不把 api 收回回环 → 8000 仍对整个公网开着，反代那一层被绕过。
+        #    关键不只是"检查存在"，而是**在 up 之前**拒绝：否则留下的是个看起来成功的半配置部署。
+        ("--proxy 不检查 API_BIND", DS, BIND_LOOPBACK, "  if false; then",
+         TDS + ".DeployScriptTest.test_proxy_without_loopback_bind_is_refused_before_starting_anything"),
+        # ⑨ 起反代时忘了 --profile proxy：compose 里 proxy 是 profile 服务，默认不参与。
+        #    脚本会「成功」，只是入口是 8000 而不是反代 —— 光看输出看不出来。
+        ("起反代却不带 profile", DS, PROFILE_UP, "  docker compose up -d --build",
+         TDS + ".DeployScriptTest.test_proxy_starts_the_profile_and_uses_the_proxy_port"),
+        # ⑩ 打印的「最多 N 秒」与实现脱钩。历史版本正是如此：写死 90 次 × sleep 2s，
+        #    对外宣称 180 秒，而每次探测本身还要另算，真实上界能到分钟级。
+        ("就绪承诺与实现脱钩", DS, READY_PROMISE, READY_PROMISE_FIXED,
+         TDS + ".DeployScriptTest.test_ready_poll_honours_the_timeout_knob"),
+        # ⑪ 一直不就绪却照常打印「部署完成」——最贵的一种失败：人以为上线了
+        ("不就绪也报成功", DS, READY_GUARD, "if false; then",
+         TDS + ".DeployScriptTest.test_never_ready_fails_with_diagnostics"),
+        # ⑫ 部署脚本里出现 compose down -v = 删数据卷。这是一条数据安全不变量，
+        #    容器冒烟自带 PRE_EXISTING 保护**不会**发现，只有这条用例拦得住。
+        ("部署脚本会删数据卷", DS, DEPLOY_DONE,
+         "docker compose down -v\n" + DEPLOY_DONE,
+         TDS + ".DeployScriptTest.test_never_deletes_the_data_volume"),
     ],
 }
 
