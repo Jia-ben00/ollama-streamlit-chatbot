@@ -13,8 +13,15 @@
 | `schema` | ORM 定义与快照（缺列 / 类型 / 枚举取值 / 可空性 / 索引 / 字符集声明 / 符号台账 / 快照少表） | `tests/test_schema_snapshot.py` |
 | `container_smoke` | `.github/scripts/container_smoke.sh` 的端口断言等待逻辑 | `tests/test_container_smoke_script.py` |
 | `stream_probe` | `src/stream_probe.py` 的「流式有没有退化成攒批」判据 | `tests/test_stream_probe.py` |
-| `nginx` | `deploy/nginx/templates/default.conf.template` + compose 挂载 + `.gitattributes`（关缓冲 / HTTP1.1 / Connection 置空 / 超时 / 上游用服务名 / 占位符全大写 / 模板真挂上） | `tests/test_nginx_config.py` |
-| `deploy_script` | `deploy.sh` 的每一条前置检查与分支（没装 docker / 无 compose 插件 / 守护进程不可用 / 缺 .env / 密码缺失或不合格 / 参数打错 / `--proxy` 与 API_BIND / `--no-pull` / 轮询上限） | `tests/test_deploy_script.py` |
+| `nginx` | 明文模板 `deploy/nginx/templates/` + HTTPS 模板 `deploy/nginx/tls/` + compose 接线 + `.gitattributes`（关缓冲 / HTTP1.1 / Connection 置空 / 超时 / 上游用服务名 / 占位符全大写 / 模板真挂上 / SSL 监听 / 明文跳转 / 证书路径 / TLS 下限 / **两份模板不漂移** / 配置源可切换 / 证书只读挂载 / 探针两种模式都能用） | `tests/test_nginx_config.py`、`tests/test_nginx_tls.py` |
+| `deploy_script` | `deploy.sh` 的每一条前置检查与分支（没装 docker / 无 compose 插件 / 守护进程不可用 / 缺 .env / 密码缺失或不合格 / 参数打错 / `--proxy` 与 API_BIND / `--no-pull` / 轮询上限 / **TLS 模式下的证书与配置源检查**） | `tests/test_deploy_script.py` |
+
+HTTPS 那一半是后补的。在它之前，TLS 是本项目**唯一整层没验过**的地方，理由写的是
+「ACME 签发要有域名」—— 而那个理由只覆盖**签发**那一半：「TLS 之后流式还活着吗」
+自签一张证书就能量。所以 `tests/e2e/nginx_check.py` 多了 C / D 两段（真 TLS 握手 +
+两个反例），这里把 HTTPS 模板里**每一句承诺**都种回一次：明文口不再跳转、
+版本下限被放开、挑战路径也被跳转、偷偷加没验过的 HSTS、两份模板漂移……
+它们的共同点是「跑得好好的，只是承诺没兑现」—— 没有任何报错，只能靠有人在看。
 
 `deploy_script` 这一组和 `container_smoke` 是同一类：**被测文件长期处于「谁也没执行过」的状态**。
 `deploy.sh` 是文档里「上机第一步」，但 CI 直接跑 `container_smoke.sh`，静态校验只把它当文本读
@@ -128,9 +135,12 @@ INCONCLUSIVE_BRANCH = "            INCONCLUSIVE,\n            metrics,"
 # 只有上云 / CI 第 9 步才暴露，且暴露出来的现象（转圈等到最后出全文、
 # 反代连不上 api、容器起不来）都不是一条能看懂的报错。
 NGINX_TMPL = REPO / "deploy" / "nginx" / "templates" / "default.conf.template"
+NGINX_TLS_TMPL = REPO / "deploy" / "nginx" / "tls" / "default.conf.template"
+ENV_EXAMPLE = REPO / ".env.prod.example"
 COMPOSE = REPO / "docker-compose.yml"
 GITATTRIBUTES = REPO / ".gitattributes"
 TNX = "tests.test_nginx_config"
+TNXT = "tests.test_nginx_tls"
 
 BUFFERING_OFF = "proxy_buffering off;"
 HTTP11 = "proxy_http_version 1.1;"
@@ -138,8 +148,27 @@ CONN_EMPTY = 'proxy_set_header Connection "";'
 READ_TIMEOUT = "proxy_read_timeout 300s;"
 PROXY_PASS = "proxy_pass http://${API_UPSTREAM};"
 SERVER_NAME_LINE = "server_name ${SERVER_NAME};"
-TEMPLATE_MOUNT = "./deploy/nginx/templates:/etc/nginx/templates:ro"
+TEMPLATE_MOUNT = "${NGINX_TEMPLATES_DIR:-./deploy/nginx/templates}:/etc/nginx/templates:ro"
 GITATTR_TEMPLATE_LF = "*.template text eol=lf"
+
+# ── HTTPS 那份模板（C / D 段真跑的就是它）的锚点 ──────────────────────
+# 这一层的特点和上面那组一样：写错了**本机毫无症状**（没有域名就没人会去打它），
+# 而且安全相关的错法有两种截然不同的表现 —— 一种「跑不起来」（证书路径写错、
+# 忘了加 ssl），另一种「跑得好好的但承诺没兑现」（不跳转、放开到 TLS 1.0、
+# 挑战路径被跳转、偷偷加了 HSTS）。后者更危险，所以每条都得有人在看。
+TLS_LISTEN = "listen ${LISTEN_TLS_PORT} ssl;"
+TLS_REDIRECT = "return 301 https://$host$request_uri;"
+TLS_CERT_LINE = "ssl_certificate     /etc/nginx/certs/fullchain.pem;"
+TLS_PROTOCOLS = "ssl_protocols TLSv1.2 TLSv1.3;"
+TLS_SESSION_LINE = "ssl_session_timeout 10m;"
+ACME_ROOT = "        root /var/www/certbot;"
+TLS_SOURCE_SWITCH = "${NGINX_TEMPLATES_DIR:-./deploy/nginx/templates}"
+TLS_CERTS_MOUNT = "${TLS_CERT_DIR:-./deploy/nginx/certs}:/etc/nginx/certs:ro"
+TLS_PORT_MAP = "${PROXY_HTTPS_PORT:-443}:${PROXY_HTTPS_PORT:-443}"
+PROXY_HEALTHCHECK = ('test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:'
+                     '${PROXY_HTTP_PORT:-80}/health || wget -qO- --no-check-certificate '
+                     'https://127.0.0.1:${PROXY_HTTPS_PORT:-443}/health"]')
+PROXY_HEALTHCHECK_OLD = 'test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${PROXY_HTTP_PORT:-80}/health"]'
 
 # ── deploy_script 组的锚点 ──────────────────────────────────────
 # 这一组和 container_smoke 是同一类：被测文件长期处于「谁也没执行过」的状态。
@@ -293,6 +322,53 @@ GROUPS = {
         ("模板不钉 LF", GITATTRIBUTES, GITATTR_TEMPLATE_LF,
          "*.template text eol=crlf",
          TNX + ".TestLineEndings.test_gitattributes_forces_lf_for_nginx_config"),
+
+        # ── 以下是 HTTPS 那份模板（也就是 C / D 段真跑的那份）──────────────
+        #
+        # 这一层写错了**本机毫无症状**（没有域名就没人会去打它），而且错法有两种表现：
+        # 一种「跑不起来」（证书路径、忘了 ssl），一种「跑得好好的但承诺没兑现」
+        # （不跳转、挑战路径被跳转、版本下限被放开、偷偷加 HSTS）。后者更危险。
+        ("HTTPS 模板没开 ssl", NGINX_TLS_TMPL, TLS_LISTEN,
+         "listen ${LISTEN_TLS_PORT};",
+         TNXT + ".TestTlsServerBlock.test_listens_ssl_on_its_own_port"),
+        ("明文口不再跳转", NGINX_TLS_TMPL, TLS_REDIRECT, "return 200;",
+         TNXT + ".TestTlsServerBlock.test_plaintext_entry_only_redirects"),
+        ("证书路径不按约定", NGINX_TLS_TMPL, TLS_CERT_LINE,
+         "ssl_certificate     /etc/nginx/certs/cert.pem;",
+         TNXT + ".TestTlsServerBlock.test_certificate_paths_are_the_fixed_ones"),
+        ("TLS 版本下限被放开", NGINX_TLS_TMPL, TLS_PROTOCOLS,
+         "ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;",
+         TNXT + ".TestTlsServerBlock.test_tls_floor_is_1_2"),
+        # 两份模板漂移：只改 HTTPS 那份（改明文那份通常是有意的，改这份才是漏同步）
+        ("HTTPS 那份单独漂移", NGINX_TLS_TMPL, "    proxy_buffering off;",
+         "    proxy_buffering on;",
+         TNXT + ".TestNoDriftBetweenVariants.test_shared_region_is_byte_identical"),
+        # 挑战路径也被跳转：续期会在「还有 30 天到期」时静默失败，然后某天站点打不开
+        ("挑战路径也被跳转", NGINX_TLS_TMPL, ACME_ROOT,
+         ACME_ROOT + "\n        return 301 https://$host$request_uri;",
+         TNXT + ".TestTlsServerBlock.test_acme_challenge_is_served_before_the_redirect"),
+        # 偷偷加上没验过的 HSTS：浏览器一旦记住，回退期间站点直接打不开
+        ("加了没验过的 HSTS", NGINX_TLS_TMPL, TLS_SESSION_LINE,
+         TLS_SESSION_LINE + '\n    add_header Strict-Transport-Security "max-age=31536000";',
+         TNXT + ".TestDeliberateOmissions.test_no_hsts_header"),
+        # 配置源不能切换：HTTPS 那份永远没机会被加载，而且**没有任何东西会提醒你**
+        ("配置源不能切换", COMPOSE, TLS_SOURCE_SWITCH, "./deploy/nginx/templates",
+         TNXT + ".TestComposeWiring.test_config_source_is_switchable"),
+        # 证书目录不是只读挂载：容器里被改的东西会一直生效到下次重建
+        ("证书不是只读挂载", COMPOSE, TLS_CERTS_MOUNT,
+         "./deploy/nginx/certs:/etc/nginx/certs",
+         TNXT + ".TestComposeWiring.test_certs_are_mounted_read_only"),
+        # 443 写死不走变量：.env 里那个 PROXY_HTTPS_PORT 变成谎话
+        ("443 写死不走变量", COMPOSE, TLS_PORT_MAP, '"443:443"',
+         TNXT + ".TestComposeWiring.test_https_port_is_mapped"),
+        # 探针只认明文：HTTPS 模式下 80 是 301，容器会一直 unhealthy
+        ("探针只认明文", COMPOSE, PROXY_HEALTHCHECK, PROXY_HEALTHCHECK_OLD,
+         TNXT + ".TestComposeWiring.test_healthcheck_works_in_both_modes"),
+        # .env 模板不再声明 HTTPS 的开关：部署手册说了也没用，运维看不到
+        ("HTTPS 开关不在模板里", ENV_EXAMPLE,
+         "NGINX_TEMPLATES_DIR=./deploy/nginx/templates",
+         "# NGINX_TEMPLATES_DIR=（被拿掉了）",
+         TNXT + ".TestComposeWiring.test_env_template_declares_the_tls_switches"),
     ],
     "deploy_script": [
         # ① 密码行读不到时**静默退出** —— 本组存在的起点，也是锚点打过一次错的教训。
@@ -341,6 +417,18 @@ GROUPS = {
         ("部署脚本会删数据卷", DS, DEPLOY_DONE,
          "docker compose down -v\n" + DEPLOY_DONE,
          TDS + ".DeployScriptTest.test_never_deletes_the_data_volume"),
+        # ⑬ TLS 模式下不检查证书就 up：nginx 会在容器里当场退出，而用户看到的
+        #    是一串 nginx 日志 + 一次白等的构建（还以为是网络问题）。
+        #    锚点带上下一行，因为文件里有两处 `if [[ "$TLS_MODE" == "1" ]]`。
+        ("TLS 模式不检查证书", DS,
+         'if [[ "$TLS_MODE" == "1" ]]; then\n  CERT_DIR=',
+         'if false; then\n  CERT_DIR=',
+         TDS + ".DeployScriptTest.test_tls_without_the_private_key_is_refused_before_starting"),
+        # ⑭ 配置源目录不存在也不拦：反代容器挂到空目录上，服务的是镜像自带的默认站点 ——
+        #    那**也是 200**，只有 /health 变成 404，很容易被当成「反代起来了，只是路径不对」。
+        ("配置源目录不存在不拦", DS,
+         '[[ -d "$TEMPLATES_DIR" ]] || die', 'true || die',
+         TDS + ".DeployScriptTest.test_missing_templates_dir_is_refused"),
     ],
 }
 

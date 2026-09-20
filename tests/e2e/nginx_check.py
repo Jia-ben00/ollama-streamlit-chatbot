@@ -9,6 +9,21 @@
 | `public_check.py` | **从外面**（你的笔记本） | 一个能访问的 URL | 上线后的公网入口成立吗 |
 | `nginx_check.py`（本文件） | 有 Docker 的机器 | compose 已在跑 | **上云之前**：仓库那份 nginx 配置经真 nginx 之后，流式还是真流式吗 |
 
+本文件里有三段，各自都要有反例（只有正例的「通过」什么都证明不了）：
+
+- **A**：仓库的**明文**配置（`deploy/nginx/templates`）→ 真应用（chunked 分帧）；
+- **B**：反例 —— 开着 `proxy_buffering`、上游换成靠关连接结束的 `plain_sse.py`，
+  **必须**被判成 BUFFERED；
+- **C**：仓库的 **HTTPS** 配置（`deploy/nginx/tls`）→ 真应用，自签证书、真 TLS 握手，
+  再做两个反例：默认信任链**必须**拒绝这张自签证书（证明校验真的开着）、
+  开着 buffering 的 TLS 变体**必须**被判成攒批（证明这把尺子在 TLS 下不瞎）。
+
+为什么 C 段值得存在：TLS 长期是本项目**唯一一整个没验过的层**，当初的理由是
+「ACME 签发要有域名 + 公网 IP」。那个理由只覆盖签发那一半 —— 「TLS 之后流式还活着吗」
+和「这把尺子在 TLS 下量得出攒批吗」根本不需要域名，自签一张证书就能量。
+（`read_sse` 的 `use_tls` 分支此前**从未被执行过**：没验过的代码就是没写过的代码。）
+真正还没验的只剩 ACME 签发与续期那一段，见 docs/DEPLOY.md §6.2。
+
 和 `public_check.py` 的区别只在于「位置」：它要你先把服务上线、再从另一台机器打进来；
 本脚本用**同一个 nginx 镜像、同一份仓库模板**在本地/CI 起一个反代容器接上去量，
 所以上云之前就能把这一层验掉。
@@ -58,6 +73,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -83,8 +99,15 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 TEMPLATE = REPO / "deploy" / "nginx" / "templates" / "default.conf.template"
+TEMPLATES_DIR = TEMPLATE.parent                      # 明文那一份
+TEMPLATES_TLS_DIR = REPO / "deploy" / "nginx" / "tls"  # HTTPS 那一份
 NGINX_IMAGE = os.getenv("NGINX_IMAGE", "nginx:1.27-alpine")
 PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# HTTPS 模板写死的证书文件名（容器内 /etc/nginx/certs/ 下）。与
+# deploy/nginx/tls/default.conf.template、deploy.sh、docs/DEPLOY.md §6.2 是同一组约定。
+CERT_FILE = "fullchain.pem"
+KEY_FILE = "privkey.pem"
 
 failures = []
 
@@ -155,6 +178,63 @@ def wait_http(port, path="/", seconds=30):
     return False
 
 
+def wait_redirect(port, seconds=30):
+    """等明文入口开始回 3xx（TLS 段的就绪判据），返回那个响应。
+
+    ⚠️ 这里不能用 `wait_http()`：`requests` 默认**跟随跳转**，跟到 https 之后容器里
+    没有可信 CA、连接直接失败，于是「服务已经好了」被当成「还没起来」，
+    一直等到超时 —— 又是一个「探针自己不成立」的形态。
+    """
+    for _ in range(int(seconds * 2)):
+        try:
+            r = requests.get(f"http://127.0.0.1:{port}/health", timeout=2,
+                             allow_redirects=False)
+            if r.status_code in (301, 302, 307, 308):
+                return r
+        except requests.RequestException:
+            pass
+        time.sleep(0.5)
+    return None
+
+
+def find_openssl():
+    """找 openssl：先 PATH，再兜 Windows 上 Git for Windows 的固定位置。
+
+    TLS 段要签一张自签证书，而**镜像里没有 openssl**：`nginx:1.27-alpine` 与
+    `alpine:3.20` 都实测 `openssl: not found`（基础镜像不带 CLI）。
+    宿主机一定有：Linux/macOS 自带，Windows 装了 Git 就有。
+    找不到就响亮地失败（见 main 里的提示），**不静默跳过** —— 跳过等于这一层又没验。
+    """
+    found = shutil.which("openssl")
+    if found:
+        return found
+    for cand in (r"C:\Program Files\Git\usr\bin\openssl.exe",
+                 r"C:\Program Files (x86)\Git\usr\bin\openssl.exe"):
+        if Path(cand).exists():
+            return cand
+    return None
+
+
+def make_self_signed(openssl, outdir):
+    """签一张只给 localhost / 127.0.0.1 用的自签证书，写进 outdir。返回 (证书, 私钥)。"""
+    cert, key = Path(outdir) / CERT_FILE, Path(outdir) / KEY_FILE
+    p = subprocess.run(
+        [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", str(key), "-out", str(cert), "-days", "2",
+         "-subj", "/CN=localhost",
+         # ⚠️ SAN 里必须带 IP:127.0.0.1。read_sse 用 `server_hostname=host` 校验，
+         # 而 host 就是 127.0.0.1；现代客户端**不再回退到 CN**，只写 CN=localhost
+         # 会得到 `IP address mismatch` —— 一个看着像「证书没生效」、
+         # 其实是校验策略的报错，很容易往错的方向排查。
+         "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+        capture_output=True, text=True, errors="replace", timeout=120)
+    if p.returncode != 0:
+        raise RuntimeError(f"自签证书生成失败（rc={p.returncode}）：{p.stderr.strip()[-400:]}")
+    if not (cert.exists() and key.exists()):
+        raise RuntimeError("openssl 说成功，但证书或私钥文件不在")
+    return cert, key
+
+
 def diagnose(name):
     """失败时把容器的状态与日志原样带出来 —— 否则只剩一句看不懂的报错。"""
     state = sh(["docker", "inspect", "-f", "{{.State.Status}} exit={{.State.ExitCode}}", name],
@@ -188,13 +268,27 @@ def compose_network():
     return cid, (nets[0] if nets else None), image
 
 
-def start_nginx(name, network, port, *, mount_templates=None, mount_conf=None, env=None):
+def start_nginx(name, network, port, *, mount_templates=None, mount_conf=None,
+                mount_certs=None, env=None, extra_ports=()):
+    """起一个反代容器。
+
+    - `mount_templates`：挂**仓库里那份模板目录**到 /etc/nginx/templates，走镜像自己的
+      envsubst —— 也就是上线时的真实路径（A、C 段都用它）；
+    - `mount_conf`：直接挂一份渲染好的配置（反例用，B 段）；
+    - `mount_certs`：HTTPS 段的证书目录。模板里写死读 /etc/nginx/certs/，所以挂载点固定；
+    - `extra_ports`：同一个容器里还要映射的**其它**端口。HTTPS 那份配置同时监听明文口
+      （只做 301）与 TLS 口，所以这里必须能映射两个。
+    """
     cmd = ["docker", "run", "-d", "--rm", "--name", name, "--network", network,
            "-p", f"127.0.0.1:{port}:{port}"]
+    for p in extra_ports:
+        cmd += ["-p", f"127.0.0.1:{p}:{p}"]
     if mount_templates:
         cmd += ["-v", f"{mount_templates}:/etc/nginx/templates:ro"]
     if mount_conf:
         cmd += ["-v", f"{mount_conf}:/etc/nginx/conf.d/default.conf:ro"]
+    if mount_certs:
+        cmd += ["-v", f"{mount_certs}:/etc/nginx/certs:ro"]
     for k, v in (env or {}).items():
         cmd += ["-e", f"{k}={v}"]
     cmd.append(NGINX_IMAGE)
@@ -235,7 +329,19 @@ def main():
     ap.add_argument("--stub-port", type=int, default=None,
                     help="反例用的裸 SSE 上游端口（默认自动挑一个空闲端口）")
     ap.add_argument("--keep", action="store_true", help="失败时保留容器便于排查")
+    ap.add_argument("--timeout", type=float, default=30.0,
+                    help="单次 SSE 读取的上限（秒）。与 read_sse 的默认值一致")
+    ap.add_argument("--no-tls", action="store_true",
+                    help="跳过 HTTPS（C / D 段）。跳过了就等于 TLS 这一层**没被验证** —— "
+                         "只在确实跑不了时用（比如宿主上找不到 openssl），别在 CI 上用")
     args = ap.parse_args()
+
+    # 自签证书得靠宿主上的 openssl：镜像里**没有**（nginx:alpine / alpine 基础镜像都实测
+    # `openssl: not found`）。找不到就响亮地失败，不静默跳过 ——
+    # 静默跳过会让「TLS 没验过」伪装成「全绿」。
+    openssl = None if args.no_tls else find_openssl()
+    if args.no_tls:
+        print("[warn] --no-tls：跳过 HTTPS 段 —— TLS 这一层这次**没有**被验证")
 
     try:
         sh(["docker", "version", "--format", "{{.Server.Version}}"])
@@ -377,15 +483,176 @@ def main():
             diagnose("nginx_check_b")
             diagnose("nginx_check_stub")
 
+        # ── C：HTTPS（TLS 终结）──────────────────────────────────────────
+        #
+        # 这一段回答两件**都不需要域名**的事：
+        #   ① 经过真 TLS 握手之后，流式还是逐块到达的吗；
+        #   ② 这把尺子在 TLS 下还量得出攒批吗 —— TLS 有记录层分帧，会改变 recv() 的
+        #      切分方式，不测就只是猜（和 B 段「chunked 本来就不攒批」是同一类反直觉）。
+        # 证书用自签的：TLS 终结这层的正确性与「证书是谁签的」无关；
+        # 真正需要域名的是签发与续期（ACME）那一半，见 docs/DEPLOY.md §6.2。
+        print()
+        print("── C：仓库的 HTTPS 配置 → 真 TLS 握手 → api ──")
+        if not openssl:
+            check("HTTPS 段能跑（需要宿主上的 openssl 来签自签证书）", False,
+                  "找不到 openssl。镜像里没有（nginx:alpine 与 alpine 基础镜像都实测不带 CLI），"
+                  "只能借宿主的：Linux/macOS 自带，Windows 装了 Git 就有。"
+                  "确实跑不了时用 --no-tls 显式跳过 —— 但那一跳就等于 TLS 这层没被验证")
+            print()
+            print(f"{len(failures)} 项失败：" + "; ".join(failures))
+            return 1
+
+        certs_dir = workdir / "certs"
+        certs_dir.mkdir(exist_ok=True)
+        try:
+            cert, key = make_self_signed(openssl, certs_dir)
+        except RuntimeError as exc:
+            check("自签证书生成", False, str(exc))
+            print()
+            print(f"{len(failures)} 项失败：" + "; ".join(failures))
+            return 1
+        info(f"自签证书：{cert.name} + {key.name}（SAN 含 DNS:localhost / IP:127.0.0.1）")
+
+        tls_template = TEMPLATES_TLS_DIR / "default.conf.template"
+        port_c, port_c_plain = free_port(), free_port()
+        env_c = {"SERVER_NAME": "_", "API_UPSTREAM": "api:8000",
+                 "LISTEN_PORT": str(port_c_plain), "LISTEN_TLS_PORT": str(port_c)}
+        start_nginx("nginx_check_c", network, port_c,
+                    mount_templates=TEMPLATES_TLS_DIR.as_posix(),
+                    mount_certs=certs_dir.as_posix(),
+                    env=env_c, extra_ports=[port_c_plain])
+
+        plain_c = wait_redirect(port_c_plain, seconds=30)
+        if plain_c is None:
+            check("HTTPS 反代容器 C 起得来（明文口开始回 301）", False, "")
+            diagnose("nginx_check_c")
+            print()
+            print(f"{len(failures)} 项失败：" + "; ".join(failures))
+            return 1
+        loc = plain_c.headers.get("Location", "")
+        # 本机这两个端口是临时挑的，所以只断言「跳到了 https 且路径没丢」；
+        # 生产是 80 → 443，模板里 `https://$host$request_uri` 拼出来正好对。
+        check("明文入口只做跳转：3xx → https 且路径保留",
+              loc.startswith("https://") and loc.endswith("/health"),
+              f"{plain_c.status_code} → {loc}")
+
+        # 自检：镜像渲染出来的配置 == 我们本地渲染的。下面那份「TLS 攒批反例」由本地渲染生成，
+        # 这一条保证它与真实路径同源（A 段同样的做法）。
+        conf_c_inside = sh(["docker", "exec", "nginx_check_c",
+                            "cat", "/etc/nginx/conf.d/default.conf"])
+        ours_c = render(tls_template.read_text(encoding="utf-8"), env_c)
+        check("HTTPS 模板经镜像渲染后与本地渲染逐字符一致",
+              conf_c_inside.strip() == ours_c.strip(),
+              "不一致 ⇒ 反例那份配置不代表真实路径，它的结论也就不算数")
+
+        # ── C 的测量：真应用，经真 TLS ──────────────────────────────────
+        h = requests.get(f"https://127.0.0.1:{port_c}/health", timeout=15, verify=str(cert))
+        check("经真 TLS：/health 200（握手与证书校验都过了）", h.status_code == 200,
+              f"HTTP {h.status_code}")
+
+        r_c = requests.post(f"https://127.0.0.1:{port_c}/conversations", timeout=15,
+                            verify=str(cert),
+                            json={"title": "nginx_check_tls", "model_id": args.model_id,
+                                  "user_id": args.user_id})
+        if r_c.status_code not in (200, 201):
+            check("经真 TLS 建会话", False, f"HTTP {r_c.status_code} {r_c.text[:160]}")
+            print()
+            print(f"{len(failures)} 项失败：" + "; ".join(failures))
+            return 1
+        conv_c = r_c.json()["id"]
+
+        headers_c, events_c, total_c = read_sse(
+            "127.0.0.1", port_c, {"conversation_id": conv_c, "content": args.prompt},
+            use_tls=True, ca_file=str(cert))
+        arrivals_c = [t for e, t in events_c if "chunk" in e]
+        verdict_c, m_c, reason_c = judge_incremental(arrivals_c, total_c)
+        show(m_c, reason_c)
+        check("经真 TLS：回复仍是逐块到达的（TLS 没有把它攒起来）",
+              verdict_c == INCREMENTAL,
+              reason_c if verdict_c != INCREMENTAL
+              else f"{m_c['chunks']} 块，跨度 {m_c['span']}s")
+
+        # 反例①：默认信任链**必须**拒绝这张自签证书。
+        # 如果它居然连上了，说明证书校验根本没开（或被人关掉了）—— 那 C 段那条「通过」
+        # 只能证明「有人愿意跟我说话」，证明不了「对面是这个服务」。
+        trust_err = None
+        try:
+            read_sse("127.0.0.1", port_c, {"conversation_id": conv_c, "content": args.prompt},
+                     use_tls=True, timeout=args.timeout)
+        except ssl.SSLError as exc:
+            trust_err = exc
+        check("反例：默认信任链拒绝自签证书（证明证书校验真的开着）",
+              isinstance(trust_err, ssl.SSLCertVerificationError),
+              f"期望 SSLCertVerificationError，实际="
+              f"{type(trust_err).__name__ if trust_err else '连上了、没有任何报错'}"
+              " —— 不报错就意味着任何中间人都能冒充这台服务器")
+
+        # 反例②：把 HTTPS 模板的 proxy_buffering 打开、上游换成靠关连接结束的 stub，
+        # 必须被判成攒批。与 B 段同一个道理，只是通道换成了 TLS。
+        port_d, port_d_plain = free_port(), free_port()
+        env_d = {"SERVER_NAME": "_", "API_UPSTREAM": stub_upstream,
+                 "LISTEN_PORT": str(port_d_plain), "LISTEN_TLS_PORT": str(port_d)}
+        conf_d_text = render(tls_template.read_text(encoding="utf-8"), env_d)
+        buf_d = conf_d_text.replace("    proxy_buffering off;", "    proxy_buffering on;")
+        check("HTTPS 反例配置确实改动了（否则反例不是反例）", buf_d != conf_d_text,
+              "HTTPS 模板里找不到 `    proxy_buffering off;`，锚点失效")
+        upstream_ok_d = f"proxy_pass http://{stub_upstream};" in buf_d
+        check("HTTPS 反例的上游指向裸 SSE stub（不是真应用）", upstream_ok_d,
+              f"反例必须打到 close-delimited 的 stub（{stub_upstream}）；"
+              "打到真应用（chunked）上它永远不会被判成攒批")
+        if buf_d == conf_d_text or not upstream_ok_d:
+            print()
+            print(f"{len(failures)} 项失败：" + "; ".join(failures))
+            return 1
+
+        tls_buf_dir = workdir / "tls_buf"
+        tls_buf_dir.mkdir(exist_ok=True)
+        (tls_buf_dir / "default.conf.template").write_bytes(buf_d.encode("utf-8"))
+        start_nginx("nginx_check_d", network, port_d,
+                    mount_templates=tls_buf_dir.as_posix(),
+                    mount_certs=certs_dir.as_posix(),
+                    env=env_d, extra_ports=[port_d_plain])
+        if wait_redirect(port_d_plain, seconds=30) is None:
+            check("反例容器 D 起得来并能回话", False, "")
+            diagnose("nginx_check_d")
+            diagnose("nginx_check_stub")
+            return 1
+
+        print()
+        print("── D（反例）：TLS + proxy_buffering on → 裸 SSE 上游 ──")
+        try:
+            _, events_d, total_d = read_sse("127.0.0.1", port_d, {}, path="/",
+                                            use_tls=True, ca_file=str(cert))
+        except OSError as exc:
+            check("反例链路读得通（经 TLS）", False, f"{type(exc).__name__}: {exc}")
+            diagnose("nginx_check_d")
+            diagnose("nginx_check_stub")
+            print()
+            print(f"{len(failures)} 项失败：" + "; ".join(failures))
+            return 1
+        arrivals_d = [t for e, t in events_d if "chunk" in e]
+        verdict_d, m_d, reason_d = judge_incremental(arrivals_d, total_d)
+        show(m_d, reason_d)
+        check("反例：TLS 下开着 proxy_buffering 仍被判成攒批（尺子在 TLS 上不瞎）",
+              verdict_d == BUFFERED,
+              f"实测判定={verdict_d}，期望 {BUFFERED}。"
+              f"若为 {INCREMENTAL}：判据在 TLS 这一层失效，C 的「通过」说明不了任何事；"
+              f"若为 {INCONCLUSIVE}：块数不够，或 stub 没被连上（下面有容器日志）")
+        if verdict_d != BUFFERED:
+            diagnose("nginx_check_d")
+            diagnose("nginx_check_stub")
+
         print()
         if failures:
             print(f"{len(failures)} 项失败：" + "; ".join(failures))
             return 1
-        print("全部通过：经真 nginx 流式没有退化成攒批，且判据在反例上确实会红。")
+        print("全部通过：明文与 HTTPS 两条路径上，流式都没有退化成攒批，"
+              "且判据在两个反例上确实会红。")
         return 0
     finally:
         if not (args.keep and failures):
-            cleanup(["nginx_check_a", "nginx_check_b", "nginx_check_stub"])
+            cleanup(["nginx_check_a", "nginx_check_b", "nginx_check_c", "nginx_check_d",
+                     "nginx_check_stub"])
         shutil.rmtree(workdir, ignore_errors=True)
 
 
