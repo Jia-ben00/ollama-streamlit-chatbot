@@ -23,7 +23,7 @@ Docker Desktop 4.91 / 引擎 29.8.0（2026-09-19 装上，在此之前本机没�
 | SSE 流式（服务端到客户端） | 9 个 chunk，块间隔均匀 **47ms**（服务端设定 50ms），`Content-Type: text/event-stream` |
 | SSE 流式（前端客户端读到的） | 9 个 chunk，块间隔 **[50, 51, 51, 51, 50, 51, 51, 50] ms** —— 前端侧没有二次缓冲 |
 | emoji 往返 | `表情测试 🚀😀🔥` 经 HTTP → MySQL → HTTP 无损，`@@character_set_connection = utf8mb4` |
-| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上真跑整套（含明文 A/B、HTTPS C/C′/D，以及 `deploy.sh --proxy` 那一段）；**本机也跑通了**（2026-09-20，Docker Desktop）：`bash .github/scripts/container_smoke.sh` → **47 PASS / 0 FAIL**（8/10 端到端 22 条 + 9/10 反代 14 条 + **10/10 反代部署路径 11 条**）+ 10 项 shell 级 ✓，退出码 0，详见第 9 节 |
+| **容器化部署（真跑 Docker）** | ✅ CI 每次 push 在 GitHub runner 上真跑整套（含明文 A/B、HTTPS C/C′/D，以及 `deploy.sh --proxy` 那一段；run `35491236413` → **47 PASS / 0 FAIL**，约 2 分 53 秒）；**本机也跑通了**（2026-09-20，Docker Desktop）：`bash .github/scripts/container_smoke.sh` → **47 PASS / 0 FAIL**（8/10 端到端 22 条 + 9/10 反代 14 条 + **10/10 反代部署路径 11 条**）+ 10 项 shell 级 ✓，退出码 0，详见第 9 节 |
 | **上机第一条命令（`deploy.sh --proxy`）整条路径** | ✅ 本机真跑过（2026-09-20）：compose 的 `proxy` 服务真的起来了（`profiles: ["proxy"]` 生效）、那颗「先探明文、失败再探 HTTPS」的双模式 healthcheck 在 TLS 下真的通过、明文口 301 跟着跳到得了 HTTPS 200、`public_check.py --ca` 第一次真跑并退出 0；`.env` 全程按字节还原（sha256 一致）。**这条路径在本轮之前谁也没执行过** —— 而它正是云主机上的第一条命令 |
 | 容器里三个依赖探针 | `checks={"database":true,"redis":true,"ollama":true}` —— 分别证明「compose 服务名解析」「`REDIS_URL` 指向服务名」「`extra_hosts`/`host-gateway`」三处配置**真的生效**，而不只是写在文件里 |
 | 忽略规则与权限真的生效 | 容器内 `ls` 确认 `/app/.env`、`/app/.git`、`/app/tests`、`/app/app.py` 都不存在；容器内 `uid=1000`（非 root）；`mysql:{"3306/tcp":null}`、`redis:{"6379/tcp":null}`、`api: HostPort 8000` |
