@@ -41,4 +41,10 @@ jobs:
         run: python -m compileall -q app.py src api db sentiment_analysis tests
 
       - name: Run unit tests
-        run: python -m unittest discover tests -v
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover tests -v 2>&1 | tee "$RUNNER_TEMP/unittest.log"
+
+      - name: Guard - README 声明的用例数必须与实际一致
+        run: python .github/scripts/check_test_count.py "$RUNNER_TEMP/unittest.log"
